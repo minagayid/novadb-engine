@@ -1,0 +1,19 @@
+NovaDB package inventory
+Tests: 4 tests passed
+Benchmark: benchmark.json
+Source files:
+benchmarks/bench.py
+novadb/__init__.py
+novadb/__main__.py
+novadb/__pycache__/__init__.cpython-312.pyc
+novadb/__pycache__/__main__.cpython-312.pyc
+novadb/__pycache__/cli.cpython-312.pyc
+novadb/__pycache__/engine.cpython-312.pyc
+novadb/__pycache__/replication.cpython-312.pyc
+novadb/__pycache__/server.cpython-312.pyc
+novadb/cli.py
+novadb/engine.py
+novadb/replication.py
+novadb/server.py
+tests/test_engine.py
+tests/test_runner.py

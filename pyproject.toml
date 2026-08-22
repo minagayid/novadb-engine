@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "novadb"
+version = "0.1.0"
+description = "A compact embedded SQL/JSON/vector database-engine prototype"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+novadb = "novadb.cli:main"
+novadb-server = "novadb.server:main"

@@ -1,0 +1,5 @@
+NovaDB optimized validation
+Tests: 4 tests passed
+Python compile: passed
+Benchmark artifact: benchmark.json
+Optimization report: OPTIMIZATION_REPORT.md
