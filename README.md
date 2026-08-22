@@ -113,9 +113,23 @@ rows = db.prepare(\"SELECT name, score + ? AS boosted FROM items WHERE score >= 
 
 The next-phase benchmark reports **0.0146 seconds** for a prepared 10,000-row batch insert, **0.0880 seconds** for literal SQL bulk insert, **0.00735 seconds** for grouped aggregation, and **0.00445 seconds** for a prepared filtered projection. These are prototype measurements on one sandbox workload, not universal superiority claims.
 
+## Distributed consensus and cost-based joins
+
+NovaDB now includes a deterministic **Raft-style reference layer** in `novadb/raft.py`. It implements follower/candidate/leader roles, term and vote persistence, RequestVote, AppendEntries, conflict backtracking, quorum commit, ordered state-machine application, partition injection, and a `ReplicatedEngine` adapter that applies committed SQL commands to multiple NovaDB engines. Use it as a testable control-plane foundation; production deployment still requires a real network transport, durable quorum acknowledgements, membership changes, snapshots, deduplication, security, and crash-injection testing.
+
+The new `novadb/optimizer.py` module provides cost-based plans for inner equi-joins. It estimates cardinality from relation sizes and distinct key counts, compares hash join with nested-loop cost, chooses the smaller hash build side, preserves qualified names, and exposes plan trees through `EXPLAIN`.
+
+```sql
+EXPLAIN SELECT u.name, o.amount
+FROM users u JOIN orders o ON u.id = o.user_id
+WHERE o.amount >= 75;
+```
+
+The reusable agent workflow for extending NovaDB is available at `/home/ubuntu/skills/novadb-engineering/SKILL.md`. The detailed implementation report is in [`DISTRIBUTED_OPTIMIZER_REPORT.md`](DISTRIBUTED_OPTIMIZER_REPORT.md).
+
 ## Validation
 
-The repository includes a dependency-free regression runner covering SQL execution, JSON extraction, vector distance, grouped aggregation, durability and recovery, optimistic conflicts, WAL follower replay, page checksums, prepared batch inserts, and bytecode queries.
+The repository includes a dependency-free regression runner covering SQL execution, JSON extraction, vector distance, grouped aggregation, durability and recovery, optimistic conflicts, WAL follower replay, page checksums, prepared batch inserts, bytecode queries, multi-table joins, optimizer plan selection, Raft election and quorum commit, minority partition rejection, and replicated NovaDB commands.
 
 ```bash
 cd /home/ubuntu/novadb

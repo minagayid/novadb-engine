@@ -928,6 +928,9 @@ class Engine:
 
     def explain(self, sql: str) -> dict[str, Any]:
         sql = sql.strip().rstrip(";")
+        if " JOIN " in f" {sql.upper()} ":
+            from .optimizer import QueryPlanner
+            return QueryPlanner(self.tables).explain(sql)
         if not sql.upper().startswith("SELECT"):
             return {"operation": "write", "engine": "NovaDB optimistic WAL transaction"}
         return {"operation": "scan", "engine": "NovaDB vector-friendly row scan", "sql": sql, "features": ["snapshot visibility", "predicate pushdown", "aggregate pipeline"]}
@@ -1063,6 +1066,9 @@ def execute_in_transaction(tx: Transaction, sql: str) -> list[dict[str, Any]] | 
         tail = match.group(2).strip()
         where = tail[5:].strip() if tail.upper().startswith("WHERE") else None
         return {"status": "deleted", "count": tx.delete(match.group(1), where)}
+    if upper.startswith("SELECT") and re.search(r"\bJOIN\b", upper):
+        from .optimizer import QueryExecutor
+        return QueryExecutor(tx.tables).execute(sql)
     if upper.startswith("SELECT"):
         match = re.match(r"^SELECT\s+(.*?)\s+FROM\s+(\w+)(.*)$", sql, re.IGNORECASE | re.DOTALL)
         if not match:
