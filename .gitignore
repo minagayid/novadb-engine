@@ -8,3 +8,4 @@ __pycache__/
 benchmark_*.json
 profile*.txt
 .DS_Store
+*.egg-info/

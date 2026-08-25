@@ -9,6 +9,15 @@ description = "A compact embedded SQL/JSON/vector database-engine prototype"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["novadb*"]
+exclude = ["skills*"]
+
 [project.scripts]
 novadb = "novadb.cli:main"
 novadb-server = "novadb.server:main"
