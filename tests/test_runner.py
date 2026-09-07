@@ -13,7 +13,9 @@ def test_sql_json_vector_and_analytics():
     assert rows == [{"name": "beta", "team": "blue"}, {"name": "gamma", "team": "red"}], rows
     stats = db.execute("SELECT JSON_EXTRACT(meta, '$.team') AS team, COUNT(*) AS n FROM docs GROUP BY team ORDER BY team")
     assert stats == [{"team": "blue", "n": 1}, {"team": "red", "n": 2}], stats
-    assert db.execute("SELECT name FROM docs ORDER BY VECTOR_DISTANCE(embedding, '[1,0]') LIMIT 1")[0]["name"] == "alpha"
+    nearest = db.execute("SELECT name, VECTOR_DISTANCE(embedding, '[1,0]') AS distance FROM docs ORDER BY distance LIMIT 1")[0]
+    assert nearest["name"] == "alpha"
+    assert abs(nearest["distance"]) < 1e-9
     assert abs(vector_distance([1, 0], [0, 1]) - 1.0) < 1e-9
 
 

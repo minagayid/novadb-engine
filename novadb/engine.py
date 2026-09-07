@@ -222,6 +222,17 @@ def vector_distance(left: Any, right: Any, metric: str = "cosine") -> float | No
     return 1.0 - dot / (na * nb)
 
 
+def _vector_argument(value: Any) -> Any:
+    """Accept SQL string literals containing JSON vectors as vector operands."""
+    if isinstance(value, str) and value.lstrip().startswith("["):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return value
+        return parsed if isinstance(parsed, list) else value
+    return value
+
+
 def _split_boolean(expr: str, keyword: str) -> list[str]:
     pieces = []
     depth = 0
@@ -322,7 +333,7 @@ def compile_expr(expr: str):
             return lambda row: _json_path(arg_fns[0](row), str(arg_fns[1](row)))
         if name in {"VECTOR_DISTANCE", "COSINE_DISTANCE", "L2_DISTANCE"}:
             metric = "l2" if name == "L2_DISTANCE" else "cosine"
-            return lambda row: vector_distance(arg_fns[0](row), arg_fns[1](row), metric)
+            return lambda row: vector_distance(_vector_argument(arg_fns[0](row)), _vector_argument(arg_fns[1](row)), metric)
         if name == "LENGTH":
             return lambda row: len(arg_fns[0](row)) if arg_fns[0](row) is not None else None
         if name == "UPPER":
@@ -890,7 +901,9 @@ class Engine:
         payload = {"version": self.version, "tables": {name: _table_to_dict(table) for name, table in self.tables.items()}}
         tmp = self.state_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-        with tmp.open("rb") as handle:
+        # Windows rejects fsync on a read-only descriptor (Errno 9).  Opening
+        # read/write keeps the durability barrier portable across platforms.
+        with tmp.open("rb+") as handle:
             os.fsync(handle.fileno())
         tmp.replace(self.state_file)
         self.wal_file.write_text("")

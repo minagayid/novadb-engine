@@ -1,0 +1,244 @@
+"""Prompt-to-SQL planning with an explicit approval boundary.
+
+The model may propose one bounded NovaDB statement, but this module never
+executes a generated statement during planning.  Callers must approve the
+returned plan id and SQL hash before execution.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import time
+import urllib.error
+import urllib.request
+import uuid
+from dataclasses import asdict, dataclass
+from typing import Any, Callable
+
+from .engine import Engine, NovaDBError
+
+
+class PromptPlanningError(NovaDBError):
+    """Raised when a natural-language request cannot become safe SQL."""
+
+
+_ALLOWED_STARTS = ("SELECT", "SHOW TABLES", "EXPLAIN", "CREATE TABLE", "CREATE INDEX", "INSERT INTO", "UPDATE", "DELETE FROM")
+_BLOCKED_WORDS = re.compile(r"\b(PRAGMA|ATTACH|DETACH|VACUUM|LOAD|COPY|CALL|DROP|ALTER|TRUNCATE)\b", re.IGNORECASE)
+
+
+def _single_statement(sql: str) -> str:
+    """Normalize one SQL statement and reject comments or hidden statements."""
+    value = sql.strip()
+    if value.startswith("```") and value.endswith("```"):
+        value = re.sub(r"^```(?:sql)?\s*|\s*```$", "", value, flags=re.IGNORECASE | re.DOTALL).strip()
+    if not value:
+        raise PromptPlanningError("The planner returned empty SQL")
+    quote: str | None = None
+    escaped = False
+    semicolons: list[int] = []
+    for index, char in enumerate(value):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in "'\"":
+            quote = char
+        elif char == ";":
+            semicolons.append(index)
+    if semicolons and any(value[index + 1 :].strip() for index in semicolons):
+        raise PromptPlanningError("Only one SQL statement may be proposed")
+    value = value.rstrip(";").strip()
+    if "--" in value or "/*" in value or "*/" in value:
+        raise PromptPlanningError("SQL comments are not allowed in generated plans")
+    upper = value.upper()
+    if _BLOCKED_WORDS.search(upper):
+        raise PromptPlanningError("The generated SQL uses a blocked operation")
+    if not upper.startswith(_ALLOWED_STARTS):
+        raise PromptPlanningError("The generated SQL is outside NovaDB's supported safe grammar")
+    return value
+
+
+def schema_snapshot(engine: Engine) -> dict[str, Any]:
+    """Return only the structural schema needed for planning."""
+    return {
+        "tables": {
+            name: {
+                "columns": [
+                    {
+                        "name": column.name,
+                        "type": column.type,
+                        "primary_key": column.primary_key,
+                        "not_null": column.not_null,
+                    }
+                    for column in table.columns
+                ],
+                "row_count": len(table.rows),
+            }
+            for name, table in sorted(engine.tables.items())
+        }
+    }
+
+
+def sql_risk(sql: str) -> tuple[str, bool]:
+    upper = sql.upper()
+    if upper.startswith(("SELECT", "SHOW TABLES", "EXPLAIN")):
+        return "read_only", True
+    if upper.startswith(("UPDATE", "DELETE FROM")):
+        return "destructive_or_mutating", False
+    return "mutating", False
+
+
+def _validate_table_references(sql: str, schema: dict[str, Any]) -> None:
+    """Reject common LLM hallucinations before a plan reaches approval."""
+    upper = sql.upper()
+    if upper.startswith("CREATE TABLE"):
+        return
+    known = set(schema.get("tables", {}))
+    candidates = re.findall(r"\b(?:FROM|JOIN|INTO|UPDATE|ON)\s+([A-Za-z_]\w*)", sql, re.IGNORECASE)
+    unknown = sorted({name for name in candidates if name not in known})
+    if unknown:
+        raise PromptPlanningError(f"The plan references unknown table(s): {', '.join(unknown)}")
+
+
+@dataclass
+class PromptPlan:
+    plan_id: str
+    prompt: str
+    sql: str
+    explanation: str
+    risk: str
+    read_only: bool
+    sql_sha256: str
+    schema: dict[str, Any]
+    status: str
+    created_at: float
+    expires_at: float
+
+    def public(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class OpenAICompatiblePlanner:
+    """Small standard-library client for Ollama or the local gateway."""
+
+    def __init__(self, base_url: str, model: str = "qwen3:1.7b", token: str | None = None, timeout: float = 60.0):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.token = token
+        self.timeout = timeout
+
+    def __call__(self, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
+        system = (
+            "You are NovaDB's SQL planner. Return JSON only with keys sql, explanation. "
+            "Propose exactly one statement supported by NovaDB. Never use DROP, ALTER, "
+            "TRUNCATE, PRAGMA, ATTACH, comments, multiple statements, or external tables. "
+            "Do not invent tables or columns. The caller will ask for approval before execution."
+        )
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps({"request": prompt, "schema": schema}, ensure_ascii=False)},
+            ],
+            "temperature": 0,
+            "max_tokens": 220,
+            "stream": False,
+            "reasoning_effort": "low",
+            "think": False,
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        request = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(body).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise PromptPlanningError(f"LLM planner unavailable: {exc}") from exc
+        try:
+            content = payload["choices"][0]["message"]["content"]
+            if isinstance(content, list):
+                content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+            text = str(content).strip()
+            fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.IGNORECASE | re.DOTALL)
+            if fenced:
+                text = fenced.group(1)
+            else:
+                start, end = text.find("{"), text.rfind("}")
+                text = text[start : end + 1] if start >= 0 and end > start else text
+            parsed = json.loads(text)
+            return {"sql": parsed["sql"], "explanation": parsed.get("explanation", "")}
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            raise PromptPlanningError("LLM planner returned invalid JSON") from exc
+
+
+class PromptSQLService:
+    """Create expiring plans and execute them only after explicit approval."""
+
+    def __init__(self, engine: Engine, planner: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None, ttl_seconds: int = 900):
+        self.engine = engine
+        self.planner = planner
+        self.ttl_seconds = ttl_seconds
+        self._plans: dict[str, PromptPlan] = {}
+
+    def _fallback(self, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
+        normalized = prompt.strip().lower()
+        if re.search(r"\b(show|list|what)\b.*\b(table|tables)\b", normalized):
+            return {"sql": "SHOW TABLES", "explanation": "Lists the tables without changing data."}
+        match = re.search(r"\b(?:show|list|display)\b.*\bfrom\s+([a-z_]\w*)\b", normalized)
+        if match and match.group(1) in schema["tables"]:
+            return {"sql": f"SELECT * FROM {match.group(1)} LIMIT 25", "explanation": "Previews up to 25 rows from the requested table."}
+        raise PromptPlanningError("No LLM planner is configured for this request")
+
+    def preview(self, prompt: str) -> dict[str, Any]:
+        prompt = str(prompt).strip()
+        if not prompt or len(prompt) > 2_000:
+            raise PromptPlanningError("Prompt must contain 1–2,000 characters")
+        schema = schema_snapshot(self.engine)
+        simple_table_request = re.search(r"\b(show|list|what)\b.*\b(table|tables)\b", prompt, re.IGNORECASE)
+        proposed = self._fallback(prompt, schema) if simple_table_request else (self.planner(prompt, schema) if self.planner else self._fallback(prompt, schema))
+        sql = _single_statement(str(proposed.get("sql", "")))
+        _validate_table_references(sql, schema)
+        risk, read_only = sql_risk(sql)
+        now = time.time()
+        plan = PromptPlan(
+            plan_id=uuid.uuid4().hex,
+            prompt=prompt,
+            sql=sql,
+            explanation=str(proposed.get("explanation", "Review this statement before approval."))[:1_000],
+            risk=risk,
+            read_only=read_only,
+            sql_sha256=hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+            schema=schema,
+            status="PENDING_APPROVAL",
+            created_at=now,
+            expires_at=now + self.ttl_seconds,
+        )
+        self._plans[plan.plan_id] = plan
+        return plan.public()
+
+    def approve(self, plan_id: str, approved: bool, sql_sha256: str | None = None) -> dict[str, Any]:
+        plan = self._plans.get(str(plan_id))
+        if plan is None:
+            raise PromptPlanningError("Unknown or expired plan")
+        if time.time() > plan.expires_at:
+            plan.status = "EXPIRED"
+            raise PromptPlanningError("Plan has expired; create a new preview")
+        if not approved:
+            plan.status = "REJECTED"
+            return {"ok": True, "status": plan.status, "plan": plan.public()}
+        if sql_sha256 != plan.sql_sha256:
+            raise PromptPlanningError("Approval must include the exact SQL hash shown in the preview")
+        result = self.engine.execute(plan.sql)
+        plan.status = "EXECUTED"
+        return {"ok": True, "status": plan.status, "plan": plan.public(), "result": result}

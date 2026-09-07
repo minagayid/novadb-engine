@@ -15,9 +15,10 @@ It is **not** an honest claim to replace Oracle across every enterprise workload
 | Vector data | Working | Vector values and cosine/L2 distance functions |
 | Durability | Working | Append-only WAL, fsync before commit, checkpointed state |
 | Transaction isolation | Working prototype | Snapshot transactions with optimistic commit conflict detection |
-| HTTP access | Working prototype | `GET /health` and `POST /query` |
+| HTTP access | Working prototype | `GET /health` and `POST /query`, optional bearer auth, body cap, and per-client rate limit |
+| Prompt-to-SQL | Working prototype | `POST /prompt` creates an expiring, hashed SQL preview; `POST /prompt/approve` executes only after explicit approval |
 | Replication | Reference primitive | Ordered WAL stream and follower replay helper |
-| Enterprise hardening | Not complete | Authentication, authorization, encryption, quotas, auditing, and production consensus are future work |
+| Enterprise hardening | Not complete | Encryption, auditing, backups, and production consensus remain future work; the HTTP edge now has basic auth and abuse limits |
 
 ## Quick start
 
@@ -39,12 +40,19 @@ PYTHONPATH=. python3 -m novadb /tmp/novadb-demo
 For the local HTTP service:
 
 ```bash
-PYTHONPATH=. python3 -m novadb.server /tmp/novadb-demo --port 8765
+NOVA_DB_TOKEN='replace-with-a-long-random-token' PYTHONPATH=. python3 -m novadb.server /tmp/novadb-demo --host 127.0.0.1 --port 8765
 curl http://127.0.0.1:8765/health
 curl -X POST http://127.0.0.1:8765/query \
   -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer replace-with-a-long-random-token' \
   -d '{"sql":"SELECT * FROM users"}'
 ```
+
+The HTTP service caps JSON requests at 1 MiB and defaults to 60 requests per minute per client address. A bearer token is required when binding beyond loopback; `/health` remains readable for liveness checks. These controls are intended for a private Oracle-hosted automation memory service, not as a substitute for a production API gateway.
+
+### Prompt-to-SQL approval workflow
+
+Set `NOVADB_LLM_URL` to an OpenAI-compatible base URL such as the loopback Ollama endpoint on the Oracle host. `POST /prompt` sends the natural-language request plus structural schema to the configured planner and returns one bounded SQL statement, an explanation, risk classification, SHA-256 hash, and expiry. It does not execute the statement. A caller must show that preview to a human and then call `POST /prompt/approve` with `approved: true` and the exact `sql_sha256`; rejected, altered, blocked, expired, or multi-statement plans are not executed. Without an LLM URL, only a small safe fallback handles table-listing and bounded table previews.
 
 ## Example: relational, JSON, and vector query
 
@@ -84,7 +92,7 @@ The design makes the distributed extension explicit. A leader can expose ordered
 | Transactions | Snapshot copy plus optimistic version check | MVCC timestamps, lock manager, serializable validation |
 | Indexes | In-memory equality index metadata | Durable B+ tree and vector ANN index |
 | Replication | Ordered WAL replay helper | Raft-like consensus, leases, quorum commit |
-| Service | Threaded HTTP JSON endpoint | Binary protocol, authentication, quotas, observability |
+| Service | Threaded HTTP JSON endpoint with basic auth and abuse limits | Binary protocol, durable quotas, auditing, observability |
 
 ## Correctness and durability model
 
