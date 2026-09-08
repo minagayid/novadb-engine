@@ -107,7 +107,7 @@ class NovaHandler(BaseHTTPRequestHandler):
             if self.path == "/prompt/redo":
                 self._send(200, self.prompt_service.redo(payload.get("execution_id")))
                 return
-            self._send(200, self.prompt_service.approve(payload["plan_id"], bool(payload.get("approved")), payload.get("sql_sha256")))
+            self._send(200, self.prompt_service.approve(payload["plan_id"], payload.get("approved"), payload.get("sql_sha256")))
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
             self._send(400, {"ok": False, "error": str(exc)})
         except NovaDBError as exc:

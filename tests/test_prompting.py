@@ -55,7 +55,7 @@ def test_prompt_plan_requires_exact_hash_and_blocks_hidden_sql():
 def test_prompt_plan_rejects_unknown_tables_before_approval():
     db = Engine()
     db.execute("CREATE TABLE notes (id INT PRIMARY KEY, body TEXT)")
-    service = PromptSQLService(db, planner=lambda prompt, schema: {"sql": "SELECT * FROM information_schema.tables", "explanation": "bad"})
+    service = PromptSQLService(db, planner=lambda prompt, schema: {"sql": "SELECT * FROM information_schema.tables LIMIT 1", "explanation": "bad"})
     try:
         service.preview("show database metadata")
     except PromptPlanningError as exc:
@@ -78,6 +78,7 @@ def test_prompt_mutation_has_bounded_undo_and_redo():
     redone = service.redo(executed["execution_id"])
     assert redone["status"] == "REDONE"
     assert db.execute("SELECT * FROM notes LIMIT 10") == [{"id": 1, "body": "x"}]
+    assert len(service._history) == 1
 
 
 def test_prompt_guardrails_bound_reads_and_writes():
@@ -98,3 +99,48 @@ def test_prompt_guardrails_bound_reads_and_writes():
         assert "WHERE clause" in str(exc)
     else:
         raise AssertionError("unbounded deletes must be rejected")
+
+
+def test_prompt_rejects_non_boolean_approval_and_stale_plans():
+    db = Engine()
+    db.execute("CREATE TABLE notes (id INT PRIMARY KEY, body TEXT)")
+    service = PromptSQLService(db, planner=lambda prompt, schema: {"sql": "INSERT INTO notes VALUES (1, 'x')"})
+    plan = service.preview("add a note")
+    for value in ("false", 1, None):
+        try:
+            service.approve(plan["plan_id"], value, plan["sql_sha256"])
+        except PromptPlanningError as exc:
+            assert "JSON boolean" in str(exc)
+        else:
+            raise AssertionError("approval must be a real boolean")
+    db.execute("INSERT INTO notes VALUES (2, 'outside change')")
+    try:
+        service.approve(plan["plan_id"], True, plan["sql_sha256"])
+    except PromptPlanningError as exc:
+        assert "stale" in str(exc)
+    else:
+        raise AssertionError("changed databases require a new preview")
+
+
+def test_prompt_caps_affected_rows_and_undo_snapshot_size():
+    db = Engine()
+    db.execute("CREATE TABLE notes (id INT PRIMARY KEY, body TEXT)")
+    db.execute("INSERT INTO notes VALUES (1, 'a'), (2, 'b')")
+    service = PromptSQLService(db, planner=lambda prompt, schema: {"sql": "DELETE FROM notes WHERE id >= 1"}, max_mutation_rows=1)
+    plan = service.preview("remove notes")
+    try:
+        service.approve(plan["plan_id"], True, plan["sql_sha256"])
+    except PromptPlanningError as exc:
+        assert "limited to 1 rows" in str(exc)
+    else:
+        raise AssertionError("mutations must be bounded before execution")
+    assert len(db.execute("SELECT * FROM notes LIMIT 10")) == 2
+
+    service = PromptSQLService(db, planner=lambda prompt, schema: {"sql": "INSERT INTO notes VALUES (3, 'c')"}, max_undo_snapshot_bytes=10)
+    plan = service.preview("add a note")
+    try:
+        service.approve(plan["plan_id"], True, plan["sql_sha256"])
+    except PromptPlanningError as exc:
+        assert "Undo snapshots" in str(exc)
+    else:
+        raise AssertionError("oversized undo history must be rejected before execution")

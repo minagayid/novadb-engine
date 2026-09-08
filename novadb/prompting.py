@@ -8,6 +8,7 @@ returned plan id and SQL hash before execution.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import time
@@ -18,7 +19,7 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
-from .engine import Engine, NovaDBError
+from .engine import Engine, NovaDBError, execute_in_transaction
 
 
 class PromptPlanningError(NovaDBError):
@@ -116,6 +117,7 @@ class PromptPlan:
     read_only: bool
     sql_sha256: str
     schema: dict[str, Any]
+    engine_version: int
     status: str
     created_at: float
     expires_at: float
@@ -207,6 +209,8 @@ class PromptSQLService:
         max_sql_chars: int = 4_000,
         max_select_rows: int = 1_000,
         max_insert_rows: int = 100,
+        max_mutation_rows: int = 100,
+        max_undo_snapshot_bytes: int = 1_048_576,
         history_limit: int = 10,
     ):
         self.engine = engine
@@ -215,9 +219,35 @@ class PromptSQLService:
         self.max_sql_chars = max_sql_chars
         self.max_select_rows = max_select_rows
         self.max_insert_rows = max_insert_rows
+        self.max_mutation_rows = max_mutation_rows
+        self.max_undo_snapshot_bytes = max_undo_snapshot_bytes
         self._plans: dict[str, PromptPlan] = {}
         self._history: deque[ExecutionRecord] = deque(maxlen=history_limit)
         self._redo: deque[ExecutionRecord] = deque(maxlen=history_limit)
+
+    def _capture_undo_snapshot(self) -> dict[str, Any]:
+        """Copy a bounded snapshot so history cannot retain live table rows."""
+        encoded = json.dumps(self.engine.snapshot_state(), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > self.max_undo_snapshot_bytes:
+            raise PromptPlanningError(
+                f"Undo snapshots are limited to {self.max_undo_snapshot_bytes} bytes"
+            )
+        return json.loads(encoded)
+
+    def _validate_mutation_count(self, sql: str) -> None:
+        """Run a disposable transaction to cap UPDATE/DELETE impact before commit."""
+        upper = sql.upper()
+        if not upper.startswith(("UPDATE", "DELETE FROM")):
+            return
+        trial = self.engine.begin()
+        try:
+            result = execute_in_transaction(trial, sql)
+        finally:
+            trial.rollback()
+        if result["count"] > self.max_mutation_rows:
+            raise PromptPlanningError(
+                f"UPDATE and DELETE plans are limited to {self.max_mutation_rows} rows"
+            )
 
     def _fallback(self, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
         normalized = prompt.strip().lower()
@@ -241,8 +271,9 @@ class PromptSQLService:
         elif upper.startswith("INSERT INTO"):
             values = re.split(r"\bVALUES\b", sql, maxsplit=1, flags=re.IGNORECASE)
             groups = re.findall(r"\([^()]*\)", values[1]) if len(values) == 2 else []
-            if not groups or len(groups) > self.max_insert_rows:
-                raise PromptPlanningError(f"INSERT plans are limited to {self.max_insert_rows} rows")
+            maximum = min(self.max_insert_rows, self.max_mutation_rows)
+            if not groups or len(groups) > maximum:
+                raise PromptPlanningError(f"INSERT plans are limited to {maximum} rows")
         elif upper.startswith(("UPDATE", "DELETE FROM")) and not re.search(r"\bWHERE\b", sql, re.IGNORECASE):
             raise PromptPlanningError("UPDATE and DELETE plans require a WHERE clause")
 
@@ -267,6 +298,7 @@ class PromptSQLService:
             read_only=read_only,
             sql_sha256=hashlib.sha256(sql.encode("utf-8")).hexdigest(),
             schema=schema,
+            engine_version=self.engine.version,
             status="PENDING_APPROVAL",
             created_at=now,
             expires_at=now + self.ttl_seconds,
@@ -283,27 +315,35 @@ class PromptSQLService:
             raise PromptPlanningError("Plan has expired; create a new preview")
         if plan.status != "PENDING_APPROVAL":
             raise PromptPlanningError(f"Plan is already {plan.status.lower()}")
+        if type(approved) is not bool:
+            raise PromptPlanningError("Approval must be a JSON boolean")
         if not approved:
             plan.status = "REJECTED"
             return {"ok": True, "status": plan.status, "plan": plan.public()}
-        if sql_sha256 != plan.sql_sha256:
+        if not isinstance(sql_sha256, str) or not hmac.compare_digest(sql_sha256, plan.sql_sha256):
             raise PromptPlanningError("Approval must include the exact SQL hash shown in the preview")
-        before = self.engine.snapshot_state() if not plan.read_only else None
-        result = self.engine.execute(plan.sql)
-        plan.status = "EXECUTED"
-        response: dict[str, Any] = {"ok": True, "status": plan.status, "plan": plan.public(), "result": result}
-        if before is not None:
-            execution_id = uuid.uuid4().hex
-            after = self.engine.snapshot_state()
-            record = ExecutionRecord(execution_id, plan.plan_id, plan.sql, before, after, self.engine.version)
-            self._history.append(record)
-            self._redo.clear()
-            plan.execution_id = execution_id
-            plan.undo_available = True
-            response["execution_id"] = execution_id
-            response["undo_available"] = True
-            response["plan"] = plan.public()
-        return response
+        # Keep version validation, preflight, snapshot, and commit in one engine lock.
+        # Engine uses an RLock, so execute/begin can safely acquire it again.
+        with self.engine._lock:
+            if self.engine.version != plan.engine_version:
+                raise PromptPlanningError("Plan is stale because the database changed; create a new preview")
+            self._validate_mutation_count(plan.sql)
+            before = self._capture_undo_snapshot() if not plan.read_only else None
+            result = self.engine.execute(plan.sql)
+            plan.status = "EXECUTED"
+            response: dict[str, Any] = {"ok": True, "status": plan.status, "plan": plan.public(), "result": result}
+            if before is not None:
+                execution_id = uuid.uuid4().hex
+                after = self._capture_undo_snapshot()
+                record = ExecutionRecord(execution_id, plan.plan_id, plan.sql, before, after, self.engine.version)
+                self._history.append(record)
+                self._redo.clear()
+                plan.execution_id = execution_id
+                plan.undo_available = True
+                response["execution_id"] = execution_id
+                response["undo_available"] = True
+                response["plan"] = plan.public()
+            return response
 
     def undo(self, execution_id: str | None = None) -> dict[str, Any]:
         candidates = [item for item in self._history if item.undone_version is None]
@@ -332,7 +372,6 @@ class PromptSQLService:
         version = self.engine.restore_state(record.after, expected_version=record.undone_version)
         record.undone_version = None
         self._redo.pop()
-        self._history.append(record)
         plan = self._plans.get(record.plan_id)
         if plan:
             plan.status = "EXECUTED"

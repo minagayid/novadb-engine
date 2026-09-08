@@ -76,3 +76,32 @@ def test_http_prompt_approval():
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
+
+def test_http_prompt_rejects_string_approval():
+    token = "prompt-token-123"
+    engine = Engine()
+    engine.execute("CREATE TABLE notes (id INT PRIMARY KEY, body TEXT)")
+    NovaHandler.engine = engine
+    NovaHandler.token = token
+    NovaHandler.prompt_service = PromptSQLService(engine, planner=lambda prompt, schema: {"sql": "INSERT INTO notes VALUES (1, 'x')"})
+    NovaHandler.max_body_bytes = 1_048_576
+    NovaHandler.requests_per_minute = 20
+    NovaHandler._request_windows.clear()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), NovaHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        status, raw = _request(port, "POST", "/prompt", {"prompt": "add a note"}, token)
+        assert status == 200
+        plan = json.loads(raw)["plan"]
+        status, raw = _request(port, "POST", "/prompt/approve", {"plan_id": plan["plan_id"], "approved": "false", "sql_sha256": plan["sql_sha256"]}, token)
+        assert status == 422
+        assert "JSON boolean" in json.loads(raw)["error"]
+        assert engine.execute("SELECT * FROM notes LIMIT 10") == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
