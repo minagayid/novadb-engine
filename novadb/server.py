@@ -58,14 +58,16 @@ class NovaHandler(BaseHTTPRequestHandler):
                 "tables": sorted(self.engine.tables),
                 "authentication": self.token is not None,
                 "request_limit_per_minute": self.requests_per_minute,
-                "prompt_to_sql": self.prompt_service is not None,
-                "llm_planner": bool(self.prompt_service and self.prompt_service.planner),
+        "prompt_to_sql": self.prompt_service is not None,
+        "llm_planner": bool(self.prompt_service and self.prompt_service.planner),
+        "prompt_guardrails": bool(self.prompt_service),
+        "prompt_undo_redo": bool(self.prompt_service),
             })
             return
         self._send(404, {"error": "not found"})
 
     def do_POST(self) -> None:
-        if self.path not in {"/query", "/prompt", "/prompt/approve"}:
+        if self.path not in {"/query", "/prompt", "/prompt/approve", "/prompt/undo", "/prompt/redo"}:
             self._send(404, {"error": "not found"})
             return
         if not self._authorized():
@@ -98,6 +100,12 @@ class NovaHandler(BaseHTTPRequestHandler):
                 raise NovaDBError("Prompt-to-SQL is not configured")
             if self.path == "/prompt":
                 self._send(200, {"ok": True, "plan": self.prompt_service.preview(payload["prompt"])})
+                return
+            if self.path == "/prompt/undo":
+                self._send(200, self.prompt_service.undo(payload.get("execution_id")))
+                return
+            if self.path == "/prompt/redo":
+                self._send(200, self.prompt_service.redo(payload.get("execution_id")))
                 return
             self._send(200, self.prompt_service.approve(payload["plan_id"], bool(payload.get("approved")), payload.get("sql_sha256")))
         except (ValueError, KeyError, json.JSONDecodeError) as exc:

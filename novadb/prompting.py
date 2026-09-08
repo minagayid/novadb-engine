@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
@@ -24,7 +25,7 @@ class PromptPlanningError(NovaDBError):
     """Raised when a natural-language request cannot become safe SQL."""
 
 
-_ALLOWED_STARTS = ("SELECT", "SHOW TABLES", "EXPLAIN", "CREATE TABLE", "CREATE INDEX", "INSERT INTO", "UPDATE", "DELETE FROM")
+_ALLOWED_PREFIX = re.compile(r"^(?:SELECT\b|SHOW\s+TABLES\b|EXPLAIN\b|CREATE\s+TABLE\b|CREATE\s+INDEX\b|INSERT\s+INTO\b|UPDATE\b|DELETE\s+FROM\b)", re.IGNORECASE)
 _BLOCKED_WORDS = re.compile(r"\b(PRAGMA|ATTACH|DETACH|VACUUM|LOAD|COPY|CALL|DROP|ALTER|TRUNCATE)\b", re.IGNORECASE)
 
 
@@ -58,7 +59,7 @@ def _single_statement(sql: str) -> str:
     upper = value.upper()
     if _BLOCKED_WORDS.search(upper):
         raise PromptPlanningError("The generated SQL uses a blocked operation")
-    if not upper.startswith(_ALLOWED_STARTS):
+    if not _ALLOWED_PREFIX.match(value):
         raise PromptPlanningError("The generated SQL is outside NovaDB's supported safe grammar")
     return value
 
@@ -118,9 +119,22 @@ class PromptPlan:
     status: str
     created_at: float
     expires_at: float
+    execution_id: str | None = None
+    undo_available: bool = False
 
     def public(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class ExecutionRecord:
+    execution_id: str
+    plan_id: str
+    sql: str
+    before: dict[str, Any]
+    after: dict[str, Any]
+    applied_version: int
+    undone_version: int | None = None
 
 
 class OpenAICompatiblePlanner:
@@ -185,11 +199,25 @@ class OpenAICompatiblePlanner:
 class PromptSQLService:
     """Create expiring plans and execute them only after explicit approval."""
 
-    def __init__(self, engine: Engine, planner: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None, ttl_seconds: int = 900):
+    def __init__(
+        self,
+        engine: Engine,
+        planner: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+        ttl_seconds: int = 900,
+        max_sql_chars: int = 4_000,
+        max_select_rows: int = 1_000,
+        max_insert_rows: int = 100,
+        history_limit: int = 10,
+    ):
         self.engine = engine
         self.planner = planner
         self.ttl_seconds = ttl_seconds
+        self.max_sql_chars = max_sql_chars
+        self.max_select_rows = max_select_rows
+        self.max_insert_rows = max_insert_rows
         self._plans: dict[str, PromptPlan] = {}
+        self._history: deque[ExecutionRecord] = deque(maxlen=history_limit)
+        self._redo: deque[ExecutionRecord] = deque(maxlen=history_limit)
 
     def _fallback(self, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
         normalized = prompt.strip().lower()
@@ -200,6 +228,24 @@ class PromptSQLService:
             return {"sql": f"SELECT * FROM {match.group(1)} LIMIT 25", "explanation": "Previews up to 25 rows from the requested table."}
         raise PromptPlanningError("No LLM planner is configured for this request")
 
+    def _validate_task_budget(self, sql: str) -> None:
+        if len(sql.encode("utf-8")) > self.max_sql_chars:
+            raise PromptPlanningError(f"The SQL plan exceeds the {self.max_sql_chars}-byte safety limit")
+        upper = sql.upper()
+        if upper.startswith("SELECT"):
+            match = re.search(r"\bLIMIT\s+(\d+)\s*$", sql, re.IGNORECASE)
+            if not match:
+                raise PromptPlanningError("SELECT plans must include an explicit LIMIT")
+            if int(match.group(1)) > self.max_select_rows:
+                raise PromptPlanningError(f"SELECT LIMIT cannot exceed {self.max_select_rows} rows")
+        elif upper.startswith("INSERT INTO"):
+            values = re.split(r"\bVALUES\b", sql, maxsplit=1, flags=re.IGNORECASE)
+            groups = re.findall(r"\([^()]*\)", values[1]) if len(values) == 2 else []
+            if not groups or len(groups) > self.max_insert_rows:
+                raise PromptPlanningError(f"INSERT plans are limited to {self.max_insert_rows} rows")
+        elif upper.startswith(("UPDATE", "DELETE FROM")) and not re.search(r"\bWHERE\b", sql, re.IGNORECASE):
+            raise PromptPlanningError("UPDATE and DELETE plans require a WHERE clause")
+
     def preview(self, prompt: str) -> dict[str, Any]:
         prompt = str(prompt).strip()
         if not prompt or len(prompt) > 2_000:
@@ -208,6 +254,7 @@ class PromptSQLService:
         simple_table_request = re.search(r"\b(show|list|what)\b.*\b(table|tables)\b", prompt, re.IGNORECASE)
         proposed = self._fallback(prompt, schema) if simple_table_request else (self.planner(prompt, schema) if self.planner else self._fallback(prompt, schema))
         sql = _single_statement(str(proposed.get("sql", "")))
+        self._validate_task_budget(sql)
         _validate_table_references(sql, schema)
         risk, read_only = sql_risk(sql)
         now = time.time()
@@ -234,11 +281,60 @@ class PromptSQLService:
         if time.time() > plan.expires_at:
             plan.status = "EXPIRED"
             raise PromptPlanningError("Plan has expired; create a new preview")
+        if plan.status != "PENDING_APPROVAL":
+            raise PromptPlanningError(f"Plan is already {plan.status.lower()}")
         if not approved:
             plan.status = "REJECTED"
             return {"ok": True, "status": plan.status, "plan": plan.public()}
         if sql_sha256 != plan.sql_sha256:
             raise PromptPlanningError("Approval must include the exact SQL hash shown in the preview")
+        before = self.engine.snapshot_state() if not plan.read_only else None
         result = self.engine.execute(plan.sql)
         plan.status = "EXECUTED"
-        return {"ok": True, "status": plan.status, "plan": plan.public(), "result": result}
+        response: dict[str, Any] = {"ok": True, "status": plan.status, "plan": plan.public(), "result": result}
+        if before is not None:
+            execution_id = uuid.uuid4().hex
+            after = self.engine.snapshot_state()
+            record = ExecutionRecord(execution_id, plan.plan_id, plan.sql, before, after, self.engine.version)
+            self._history.append(record)
+            self._redo.clear()
+            plan.execution_id = execution_id
+            plan.undo_available = True
+            response["execution_id"] = execution_id
+            response["undo_available"] = True
+            response["plan"] = plan.public()
+        return response
+
+    def undo(self, execution_id: str | None = None) -> dict[str, Any]:
+        candidates = [item for item in self._history if item.undone_version is None]
+        if execution_id:
+            candidates = [item for item in candidates if item.execution_id == execution_id]
+        if not candidates:
+            raise PromptPlanningError("No undoable approved mutation was found")
+        record = candidates[-1]
+        version = self.engine.restore_state(record.before, expected_version=record.applied_version)
+        record.undone_version = version
+        self._redo.append(record)
+        plan = self._plans.get(record.plan_id)
+        if plan:
+            plan.status = "UNDONE"
+            plan.undo_available = False
+        return {"ok": True, "status": "UNDONE", "execution_id": record.execution_id, "plan_id": record.plan_id}
+
+    def redo(self, execution_id: str | None = None) -> dict[str, Any]:
+        if not self._redo:
+            raise PromptPlanningError("No undone mutation is available to redo")
+        record = self._redo[-1]
+        if execution_id and record.execution_id != execution_id:
+            raise PromptPlanningError("The requested execution is not the latest undone mutation")
+        if record.undone_version is None:
+            raise PromptPlanningError("The mutation is not currently undone")
+        version = self.engine.restore_state(record.after, expected_version=record.undone_version)
+        record.undone_version = None
+        self._redo.pop()
+        self._history.append(record)
+        plan = self._plans.get(record.plan_id)
+        if plan:
+            plan.status = "EXECUTED"
+            plan.undo_available = True
+        return {"ok": True, "status": "REDONE", "execution_id": record.execution_id, "plan_id": record.plan_id, "version": version}

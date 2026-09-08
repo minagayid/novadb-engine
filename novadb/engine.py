@@ -854,6 +854,25 @@ class Engine:
         with self._lock:
             return Transaction(self)
 
+    def snapshot_state(self) -> dict[str, Any]:
+        """Return a JSON-safe state snapshot for bounded service-level undo."""
+        with self._lock:
+            return {
+                "version": self.version,
+                "tables": {name: _table_to_dict(table) for name, table in self.tables.items()},
+            }
+
+    def restore_state(self, snapshot: dict[str, Any], expected_version: int | None = None) -> int:
+        """Restore a snapshot only when no intervening commit has occurred."""
+        with self._lock:
+            if expected_version is not None and self.version != expected_version:
+                raise TransactionConflict("Cannot restore state after a concurrent commit")
+            self.tables = {name: _table_from_dict(table) for name, table in snapshot.get("tables", {}).items()}
+            self.version += 1
+            if not self.memory:
+                self.checkpoint()
+            return self.version
+
     def _append_page_records(self, operations: list[dict[str, Any]], version: int) -> None:
         if self.page_store is not None and operations:
             self.page_store.append_records([{"version": version, "operations": operations}], sync=True)

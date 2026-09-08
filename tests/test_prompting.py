@@ -62,3 +62,39 @@ def test_prompt_plan_rejects_unknown_tables_before_approval():
         assert "unknown table" in str(exc)
     else:
         raise AssertionError("unknown tables must be rejected before approval")
+
+
+def test_prompt_mutation_has_bounded_undo_and_redo():
+    db = Engine()
+    db.execute("CREATE TABLE notes (id INT PRIMARY KEY, body TEXT)")
+    service = PromptSQLService(db, planner=lambda prompt, schema: {"sql": "INSERT INTO notes VALUES (1, 'x')", "explanation": "Add one note."})
+    plan = service.preview("add a note")
+    executed = service.approve(plan["plan_id"], True, plan["sql_sha256"])
+    assert executed["undo_available"] is True
+    assert db.execute("SELECT * FROM notes LIMIT 10") == [{"id": 1, "body": "x"}]
+    undone = service.undo(executed["execution_id"])
+    assert undone["status"] == "UNDONE"
+    assert db.execute("SELECT * FROM notes LIMIT 10") == []
+    redone = service.redo(executed["execution_id"])
+    assert redone["status"] == "REDONE"
+    assert db.execute("SELECT * FROM notes LIMIT 10") == [{"id": 1, "body": "x"}]
+
+
+def test_prompt_guardrails_bound_reads_and_writes():
+    db = Engine()
+    db.execute("CREATE TABLE notes (id INT PRIMARY KEY, body TEXT)")
+    service = PromptSQLService(db, planner=lambda prompt, schema: {"sql": "SELECT * FROM notes", "explanation": "unbounded"})
+    try:
+        service.preview("read everything")
+    except PromptPlanningError as exc:
+        assert "explicit LIMIT" in str(exc)
+    else:
+        raise AssertionError("unbounded reads must be rejected")
+
+    service = PromptSQLService(db, planner=lambda prompt, schema: {"sql": "DELETE FROM notes", "explanation": "unbounded"})
+    try:
+        service.preview("delete everything")
+    except PromptPlanningError as exc:
+        assert "WHERE clause" in str(exc)
+    else:
+        raise AssertionError("unbounded deletes must be rejected")
