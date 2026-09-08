@@ -1,3 +1,6 @@
+import json
+import threading
+
 from novadb import Engine
 from novadb.prompting import PromptPlanningError, PromptSQLService
 
@@ -67,18 +70,24 @@ def test_prompt_plan_rejects_unknown_tables_before_approval():
 def test_prompt_mutation_has_bounded_undo_and_redo():
     db = Engine()
     db.execute("CREATE TABLE notes (id INT PRIMARY KEY, body TEXT)")
-    service = PromptSQLService(db, planner=lambda prompt, schema: {"sql": "INSERT INTO notes VALUES (1, 'x')", "explanation": "Add one note."})
-    plan = service.preview("add a note")
-    executed = service.approve(plan["plan_id"], True, plan["sql_sha256"])
-    assert executed["undo_available"] is True
-    assert db.execute("SELECT * FROM notes LIMIT 10") == [{"id": 1, "body": "x"}]
-    undone = service.undo(executed["execution_id"])
-    assert undone["status"] == "UNDONE"
+    service = PromptSQLService(
+        db,
+        planner=lambda prompt, schema: {"sql": "INSERT INTO notes VALUES (1, 'x')" if prompt == "first" else "INSERT INTO notes VALUES (2, 'y')"},
+    )
+    first_plan = service.preview("first")
+    first = service.approve(first_plan["plan_id"], True, first_plan["sql_sha256"])
+    second_plan = service.preview("second")
+    second = service.approve(second_plan["plan_id"], True, second_plan["sql_sha256"])
+    assert db.execute("SELECT * FROM notes LIMIT 10") == [{"id": 1, "body": "x"}, {"id": 2, "body": "y"}]
+    assert service.undo(second["execution_id"])["status"] == "UNDONE"
+    assert service.undo(first["execution_id"])["status"] == "UNDONE"
     assert db.execute("SELECT * FROM notes LIMIT 10") == []
-    redone = service.redo(executed["execution_id"])
-    assert redone["status"] == "REDONE"
-    assert db.execute("SELECT * FROM notes LIMIT 10") == [{"id": 1, "body": "x"}]
-    assert len(service._history) == 1
+    assert service.redo(first["execution_id"])["status"] == "REDONE"
+    assert service.redo(second["execution_id"])["status"] == "REDONE"
+    assert service.undo(second["execution_id"])["status"] == "UNDONE"
+    assert service.undo(first["execution_id"])["status"] == "UNDONE"
+    assert db.execute("SELECT * FROM notes LIMIT 10") == []
+    assert len(service._history) == 2
 
 
 def test_prompt_guardrails_bound_reads_and_writes():
@@ -136,7 +145,8 @@ def test_prompt_caps_affected_rows_and_undo_snapshot_size():
         raise AssertionError("mutations must be bounded before execution")
     assert len(db.execute("SELECT * FROM notes LIMIT 10")) == 2
 
-    service = PromptSQLService(db, planner=lambda prompt, schema: {"sql": "INSERT INTO notes VALUES (3, 'c')"}, max_undo_snapshot_bytes=10)
+    current_snapshot_bytes = len(json.dumps(db.snapshot_state(), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    service = PromptSQLService(db, planner=lambda prompt, schema: {"sql": "INSERT INTO notes VALUES (3, 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')"}, max_undo_snapshot_bytes=current_snapshot_bytes + 10)
     plan = service.preview("add a note")
     try:
         service.approve(plan["plan_id"], True, plan["sql_sha256"])
@@ -144,3 +154,41 @@ def test_prompt_caps_affected_rows_and_undo_snapshot_size():
         assert "Undo snapshots" in str(exc)
     else:
         raise AssertionError("oversized undo history must be rejected before execution")
+    assert len(db.execute("SELECT * FROM notes LIMIT 10")) == 2
+
+
+def test_prompt_cache_is_bounded_and_expired_plans_are_purged():
+    service = PromptSQLService(Engine(), planner=lambda prompt, schema: {"sql": "SHOW TABLES"}, max_plans=2)
+    first = service.preview("first")
+    second = service.preview("second")
+    service.preview("third")
+    assert len(service._plans) == 2
+    assert first["plan_id"] not in service._plans
+    service._plans[second["plan_id"]].expires_at = 0
+    service.preview("fourth")
+    assert second["plan_id"] not in service._plans
+
+
+def test_prompt_approval_is_single_use_under_concurrency():
+    db = Engine()
+    db.execute("CREATE TABLE notes (id INT PRIMARY KEY, body TEXT)")
+    service = PromptSQLService(db, planner=lambda prompt, schema: {"sql": "INSERT INTO notes VALUES (1, 'x')"})
+    plan = service.preview("add a note")
+    barrier = threading.Barrier(2)
+    outcomes = []
+
+    def approve():
+        barrier.wait()
+        try:
+            outcomes.append(service.approve(plan["plan_id"], True, plan["sql_sha256"])["status"])
+        except PromptPlanningError as exc:
+            outcomes.append(str(exc))
+
+    threads = [threading.Thread(target=approve) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert outcomes.count("EXECUTED") == 1
+    assert any("already executed" in outcome for outcome in outcomes)
+    assert db.execute("SELECT * FROM notes LIMIT 10") == [{"id": 1, "body": "x"}]
