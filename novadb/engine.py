@@ -960,12 +960,10 @@ class Engine:
 
     def explain(self, sql: str) -> dict[str, Any]:
         sql = sql.strip().rstrip(";")
-        if " JOIN " in f" {sql.upper()} ":
+        if sql.upper().startswith("SELECT"):
             from .optimizer import QueryPlanner
             return QueryPlanner(self.tables).explain(sql)
-        if not sql.upper().startswith("SELECT"):
-            return {"operation": "write", "engine": "NovaDB optimistic WAL transaction"}
-        return {"operation": "scan", "engine": "NovaDB vector-friendly row scan", "sql": sql, "features": ["snapshot visibility", "predicate pushdown", "aggregate pipeline"]}
+        return {"operation": "write", "engine": "NovaDB optimistic WAL transaction"}
 
 
 def _table_to_dict(table: Table) -> dict[str, Any]:
@@ -1111,7 +1109,11 @@ def execute_in_transaction(tx: Transaction, sql: str) -> list[dict[str, Any]] | 
     if upper == "SHOW TABLES":
         return [{"table": name} for name in sorted(tx.tables)]
     if upper.startswith("EXPLAIN "):
-        return [{"plan": {"operation": "scan", "sql": sql[8:].strip(), "engine": "NovaDB"}}]
+        explained_sql = sql[8:].strip()
+        if not explained_sql.upper().startswith("SELECT"):
+            raise ParseError("EXPLAIN currently supports SELECT statements only")
+        from .optimizer import QueryPlanner
+        return [{"plan": QueryPlanner(tx.tables).explain(explained_sql)}]
     raise ParseError(f"Unsupported SQL: {sql}")
 
 

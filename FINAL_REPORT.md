@@ -34,11 +34,11 @@ The included benchmark uses 10,000 rows with an integer key, text field, JSON se
 | Grouped aggregate | 0.1272 s | 0.0017 s | NovaDB is slower because its execution layer is an intentionally simple Python row pipeline |
 | Aggregate result | `a=5,000`, `b=5,000` | `a=5,000`, `b=5,000` | Results agree for the tested workload |
 
-The benchmark identifies the first optimization priorities rather than supporting a marketing conclusion. The highest-value next steps are page-oriented storage, incremental transaction state, columnar batches, expression compilation, and a cost-based optimizer.
+The benchmark identifies the first optimization priorities rather than supporting a marketing conclusion. The remaining high-value steps are a mature page manager, incremental transaction state, columnar batches, broader physical planning, and production security/operations; the repository already contains page storage, prepared execution, joins, and a cost-based optimizer at prototype scope.
 
 ## Architecture delivered
 
-The engine is organized around a small number of explicit layers. The SQL layer parses a bounded grammar and evaluates expressions through a non-`eval` interpreter. The transaction layer creates a snapshot, applies writes privately, and commits only when the engine version is unchanged. The storage layer appends committed operations to a newline-delimited WAL before publishing the new state. Checkpoints write a new state image and truncate the WAL. The service layer exposes the same engine through a minimal JSON HTTP interface.
+The engine is organized around a small number of explicit layers. The SQL layer parses a bounded grammar, evaluates expressions through a non-`eval` interpreter, and exposes cost-based inner-join plans through the Python API, SQL `EXPLAIN`, and the CLI. The transaction layer creates a snapshot, applies writes privately, and commits only when the engine version is unchanged. The storage layer appends committed operations to a checksummed page log before publishing the new state, with the newline-delimited WAL retained as a compatibility fallback. Checkpoints write a new state image and truncate the legacy WAL. The service layer exposes the same engine through a minimal JSON HTTP interface.
 
 The distributed extension is deliberately presented as a protocol boundary rather than a false guarantee. WAL records contain monotonically increasing versions and ordered operations. A follower can consume records after its last version and replay them. A production implementation must add consensus, fencing, quorum acknowledgement, checksums, split-brain handling, failure injection, and online re-sharding.
 
@@ -81,9 +81,9 @@ curl -X POST http://127.0.0.1:8765/query \
 
 ## Production gap assessment
 
-NovaDB should not yet be used as the sole store for irreplaceable data. It does not currently provide a mature page manager, buffer pool, durable B+ tree, cost-based optimizer, joins, prepared statements, full MVCC timestamps, serializable isolation, authentication, authorization, encryption, auditing, resource quotas, binary wire protocol, backups, consensus-backed replication, or a compatibility layer for enterprise SQL dialects.
+NovaDB should not yet be used as the sole store for irreplaceable data. It does not currently provide a mature page manager, buffer pool, durable B+ tree, full MVCC timestamps, serializable isolation, authentication/authorization beyond the basic HTTP bearer gate, encryption, auditing, resource quotas, binary wire protocol, backups, durable consensus-backed replication, or a compatibility layer for enterprise SQL dialects. The current optimizer, joins, prepared statements, checksummed page log, and Raft-style layer remain prototype/reference implementations.
 
-The project is nevertheless a useful foundation because each limitation is explicit and mapped to a concrete subsystem. The next release should focus on a checksummed page store and incremental MVCC before adding more SQL surface area. That sequence improves the core guarantees instead of expanding features on top of a fragile storage model.
+The project is nevertheless a useful foundation because each limitation is explicit and mapped to a concrete subsystem. The next release should focus on buffer-pool/page management and incremental MVCC before adding more SQL surface area. That sequence improves the core guarantees instead of expanding features on top of a prototype storage model.
 
 ## Final decision
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 import tempfile
 from pathlib import Path
+import subprocess
+import sys
 from novadb import Engine, TransactionConflict, vector_distance
 from novadb.replication import apply_records, stream_wal
 
@@ -98,6 +100,38 @@ def test_cost_based_joins():
     assert plan["details"]["strategy"] == "HASH_JOIN"
 
 
+def test_explain_sql_uses_the_same_optimizer_as_engine_explain():
+    db = Engine()
+    db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+    db.execute("CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount INT)")
+    db.execute("INSERT INTO users VALUES (1, 'Ada'), (2, 'Grace')")
+    db.execute("INSERT INTO orders VALUES (10, 1, 100), (11, 2, 50)")
+    sql = "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id"
+    direct_plan = db.explain(sql)
+    sql_result = db.execute("EXPLAIN " + sql)
+    assert sql_result == [{"plan": direct_plan}], sql_result
+    assert sql_result[0]["plan"]["operation"] == "HASH_JOIN"
+
+
+def test_cli_explain_exposes_the_cost_based_plan():
+    with tempfile.TemporaryDirectory() as tmp:
+        script = Path(tmp) / "explain.sql"
+        script.write_text(
+            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT);"
+            "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT);"
+            "EXPLAIN SELECT u.name, o.id FROM users u JOIN orders o ON u.id = o.user_id;",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [sys.executable, "-m", "novadb", ":memory:", "--file", str(script)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert '"operation": "HASH_JOIN"' in result.stdout, result.stdout
+        assert '"estimated_rows"' in result.stdout, result.stdout
+
+
 def test_raft_consensus():
     from novadb.raft import NotLeaderError, RaftCluster
     applied = {node_id: [] for node_id in ["n1", "n2", "n3"]}
@@ -132,7 +166,7 @@ def test_replicated_engine():
 
 
 if __name__ == "__main__":
-    tests = [test_sql_json_vector_and_analytics, test_durability_and_recovery, test_optimistic_conflict, test_replication_records, test_page_store, test_prepared_statements_and_bytecode, test_cost_based_joins, test_raft_consensus, test_replicated_engine]
+    tests = [test_sql_json_vector_and_analytics, test_durability_and_recovery, test_optimistic_conflict, test_replication_records, test_page_store, test_prepared_statements_and_bytecode, test_cost_based_joins, test_explain_sql_uses_the_same_optimizer_as_engine_explain, test_cli_explain_exposes_the_cost_based_plan, test_raft_consensus, test_replicated_engine]
     for test in tests:
         test()
         print(f"PASS {test.__name__}")

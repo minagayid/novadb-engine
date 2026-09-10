@@ -37,7 +37,7 @@ The query returns qualified output keys such as `u.name` and `o.amount`, while `
 
 ## Validation
 
-The dependency-free regression runner now passes **9/9 tests**. It covers relational SQL, JSON, vectors, grouped aggregation, restart recovery, optimistic conflicts, page checksums, prepared batch inserts, bytecode projections, join correctness, cost-based plan selection, Raft leader election, quorum commit, minority partition rejection, and replicated NovaDB commands. All Python modules pass bytecode compilation.
+The dependency-free regression runner now passes **11/11 tests**. It covers relational SQL, JSON, vectors, grouped aggregation, restart recovery, optimistic conflicts, page checksums, prepared batch inserts, bytecode projections, join correctness, cost-based plan selection through both the API and CLI, Raft leader election, quorum commit, minority partition rejection, and replicated NovaDB commands. All Python modules pass bytecode compilation.
 
 ```bash
 cd /home/ubuntu/novadb

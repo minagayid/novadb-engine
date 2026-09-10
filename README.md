@@ -9,7 +9,7 @@ It is **not** an honest claim to replace Oracle across every enterprise workload
 | Capability | Prototype status | Implementation |
 |---|---:|---|
 | Embedded, zero-admin runtime | Working | `Engine(':memory:')` or a local database directory |
-| SQL DDL/DML | Working | `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT`, `UPDATE`, `DELETE` |
+| SQL DDL/DML | Working | `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `EXPLAIN` |
 | Analytical SQL | Working | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP BY`, `ORDER BY`, `LIMIT` |
 | JSON data | Working | Native JSON values and `JSON_EXTRACT(value, '$.path')` |
 | Vector data | Working | Vector values and cosine/L2 distance functions |
@@ -86,12 +86,12 @@ The design makes the distributed extension explicit. A leader can expose ordered
 
 | Layer | Current mechanism | Next serious step |
 |---|---|---|
-| SQL | Bounded parser and expression evaluator | Cost-based optimizer, joins, window functions, prepared statements |
+| SQL | Bounded parser, expression evaluator, prepared statements, and cost-based inner-join plans | Broader SQL coverage, window functions, and a fuller logical/physical planner |
 | Execution | Row scans with aggregate pipeline | Columnar batches, late materialization, parallel operators |
-| Storage | JSON state image plus append-only WAL | Slotted pages, B+ trees, buffer pool, compaction |
+| Storage | JSON state image plus checksummed page log and append-only WAL fallback | Buffer pool, slotted pages, B+ trees, compaction |
 | Transactions | Snapshot copy plus optimistic version check | MVCC timestamps, lock manager, serializable validation |
-| Indexes | In-memory equality index metadata | Durable B+ tree and vector ANN index |
-| Replication | Ordered WAL replay helper | Raft-like consensus, leases, quorum commit |
+| Indexes | In-memory equality index metadata and exact vector distance | Durable B+ tree, statistics catalog, and vector ANN index |
+| Replication | Ordered WAL replay plus deterministic Raft-style reference layer | Real transport, durable quorum acknowledgements, leases, and membership changes |
 | Service | Threaded HTTP JSON endpoint with basic auth and abuse limits | Binary protocol, durable quotas, auditing, observability |
 
 ## Correctness and durability model
@@ -127,6 +127,8 @@ NovaDB now includes a deterministic **Raft-style reference layer** in `novadb/ra
 
 The new `novadb/optimizer.py` module provides cost-based plans for inner equi-joins. It estimates cardinality from relation sizes and distinct key counts, compares hash join with nested-loop cost, chooses the smaller hash build side, preserves qualified names, and exposes plan trees through `EXPLAIN`.
 
+`EXPLAIN SELECT ...` uses the same planner through the Python API, SQL execution path, and CLI. Join plans expose the chosen operation, estimated rows, cost, build-side size, and child scans; unsupported non-`SELECT` explanations are rejected instead of returning a misleading placeholder.
+
 ```sql
 EXPLAIN SELECT u.name, o.amount
 FROM users u JOIN orders o ON u.id = o.user_id
@@ -137,7 +139,7 @@ The reusable agent workflow for extending NovaDB is available at `/home/ubuntu/s
 
 ## Validation
 
-The repository includes a dependency-free regression runner covering SQL execution, JSON extraction, vector distance, grouped aggregation, durability and recovery, optimistic conflicts, WAL follower replay, page checksums, prepared batch inserts, bytecode queries, multi-table joins, optimizer plan selection, Raft election and quorum commit, minority partition rejection, and replicated NovaDB commands.
+The repository includes a dependency-free regression runner covering SQL execution, JSON extraction, vector distance, grouped aggregation, durability and recovery, optimistic conflicts, WAL follower replay, page checksums, prepared batch inserts, bytecode queries, multi-table joins, optimizer plan selection through both API and CLI, Raft election and quorum commit, minority partition rejection, and replicated NovaDB commands.
 
 ```bash
 cd /home/ubuntu/novadb
@@ -153,7 +155,7 @@ PYTHONPATH=. python3 benchmarks/bench.py
 
 ## Roadmap toward an enterprise-grade engine
 
-The next milestone is a real page-oriented storage manager with checksummed pages, a buffer pool, a durable catalog, and B+ tree indexes. The following milestone is a vectorized execution engine with columnar batches, joins, statistics, and a cost-based optimizer. Only after those foundations are stable should the system add MVCC timestamps, lock management, prepared statements, security, wire-protocol compatibility, and consensus-backed replication.
+The next milestone is a real page-oriented storage manager with a buffer pool, durable catalog, and B+ tree indexes. The following milestone is a vectorized execution engine with columnar batches, statistics, and broader physical planning. Only after those foundations are stable should the system add MVCC timestamps, lock management, security, wire-protocol compatibility, durable consensus integration, and production operations.
 
 The phrase “better than Oracle” should therefore be evaluated by workload and dimension. NovaDB can plausibly aim to be better for a narrow set of developer-centric embedded workloads because it is smaller and more integrated. It should not claim superiority for enterprise breadth, operational maturity, or global distributed guarantees until those properties are implemented and independently measured.
 
