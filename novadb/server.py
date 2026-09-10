@@ -84,14 +84,18 @@ class NovaHandler(BaseHTTPRequestHandler):
             })
             return
         if self.path in {"/prompt/governance", "/prompt/history"}:
+            request_id = self._request_id()
+            if not self._rate_allowed():
+                self._send(429, {"ok": False, "error": "rate limit exceeded"}, request_id, {"Retry-After": "60"})
+                return
             if not self._authorized():
-                self._send(401, {"ok": False, "error": "authentication required"})
+                self._send(401, {"ok": False, "error": "authentication required"}, request_id)
                 return
             if self.prompt_service is None:
-                self._send(422, {"ok": False, "error": "Prompt-to-SQL is not configured"})
+                self._send(422, {"ok": False, "error": "Prompt-to-SQL is not configured"}, request_id)
                 return
             payload = self.prompt_service.governance() if self.path.endswith("governance") else self.prompt_service.history()
-            self._send(200, {"ok": True, **payload})
+            self._send(200, {"ok": True, **payload}, request_id)
             return
         self._send(404, {"error": "not found"})
 

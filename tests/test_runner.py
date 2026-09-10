@@ -99,6 +99,18 @@ def test_page_store():
         raise AssertionError("expected checksum failure")
 
 
+def test_page_store_rejects_torn_tail():
+    from novadb.page_store import PageCorruptionError, PageStore
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "pages.dat"
+        path.write_bytes(b"torn page")
+        try:
+            PageStore(path, page_size=512)
+        except PageCorruptionError:
+            return
+        raise AssertionError("partial pages must fail closed")
+
+
 def test_buffer_pool_and_durable_catalog():
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "db"
@@ -249,7 +261,7 @@ def test_replicated_engine():
 
 
 if __name__ == "__main__":
-    tests = [test_sql_json_vector_and_analytics, test_structured_and_unstructured_vectors_are_validated, test_durability_and_recovery, test_optimistic_conflict, test_replication_records, test_page_store, test_buffer_pool_and_durable_catalog, test_prompt_governance_exposes_limits_without_bypassing_approval, test_prompt_undo_redo_round_trip_is_version_guarded, test_prepared_statements_and_bytecode, test_cost_based_joins, test_explain_sql_uses_the_same_optimizer_as_engine_explain, test_cli_explain_exposes_the_cost_based_plan, test_raft_consensus, test_replicated_engine]
+    tests = [test_sql_json_vector_and_analytics, test_structured_and_unstructured_vectors_are_validated, test_durability_and_recovery, test_optimistic_conflict, test_replication_records, test_page_store, test_page_store_rejects_torn_tail, test_buffer_pool_and_durable_catalog, test_prompt_governance_exposes_limits_without_bypassing_approval, test_prompt_undo_redo_round_trip_is_version_guarded, test_prepared_statements_and_bytecode, test_cost_based_joins, test_explain_sql_uses_the_same_optimizer_as_engine_explain, test_cli_explain_exposes_the_cost_based_plan, test_raft_consensus, test_replicated_engine]
     for test in tests:
         test()
         print(f"PASS {test.__name__}")

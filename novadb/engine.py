@@ -965,6 +965,8 @@ class Engine:
         assert self.catalog_file is not None
         write_catalog(self.catalog_file, self.version, self.tables)
         self.wal_file.write_text("")
+        with self.wal_file.open("rb+") as handle:
+            os.fsync(handle.fileno())
 
     def storage_status(self) -> dict[str, Any]:
         """Expose bounded storage health without exposing internal file handles."""
