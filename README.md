@@ -12,14 +12,16 @@ It is **not** an honest claim to replace Oracle across every enterprise workload
 | SQL DDL/DML | Working | `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `EXPLAIN` |
 | Analytical SQL | Working | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP BY`, `ORDER BY`, `LIMIT` |
 | JSON data | Working | Native JSON values and `JSON_EXTRACT(value, '$.path')` |
-| Vector data | Working prototype | Strict dense `VECTOR` and text-plus-embedding `VECTOR_DOCUMENT` values with cosine/L2 distance |
+| Vector data | Working prototype | Strict dense `VECTOR` and text-plus-embedding `VECTOR_DOCUMENT` values, cosine/L2 distance, and deterministic ANN-style nearest-neighbor index with exact fallback |
 | Durability | Working | Append-only WAL, fsync before commit, checkpointed state |
 | Transaction isolation | Working prototype | Snapshot transactions with optimistic commit conflict detection |
-| HTTP access | Working prototype | JSON-only requests, bearer auth off loopback, bounded bodies, per-client rate limits, request IDs, redacted internal errors |
+| HTTP access | Working prototype | JSON-only requests, bearer auth off loopback, bounded bodies, per-client rate limits, request IDs, redacted internal errors, optional TLS, and JSONL request audit |
+| Agent memory API | Working prototype | Authenticated redacted-summary storage, TTL retrieval, optional semantic search, and structured audit events |
 | Prompt-to-SQL | Governed prototype | Versioned policy, bounded SQL, exact-hash single-use approval, stale-plan rejection, and bounded undo/redo |
-| Storage boundary | Working prototype | Checksummed page reads, bounded LRU buffer pool, and an atomically published schema catalog sidecar |
+| Agent memory | Working prototype | Namespaced summary memory, optional local embeddings, bounded semantic/lexical retrieval, TTL expiry, and authenticated audit events |
+| Storage boundary | Working prototype | Checksummed page reads, bounded LRU buffer pool, schema catalog sidecar, B+ tree-backed equality lookup, and page-log compaction |
 | Replication | Reference primitive | Ordered WAL stream and follower replay helper |
-| Enterprise hardening | Not complete | Encryption, auditing, backups, and production consensus remain future work; the HTTP edge now has basic auth and abuse limits |
+| Enterprise hardening | Not complete | TLS and local request audit are available; external identity, encryption, backups, and production consensus remain future work |
 
 ## Quick start
 
@@ -30,6 +32,7 @@ cd /home/ubuntu/novadb
 PYTHONPATH=. python3 -m novadb /tmp/novadb-demo --sql "CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, profile JSON)"
 PYTHONPATH=. python3 -m novadb /tmp/novadb-demo --sql "INSERT INTO users VALUES (1, 'Ada', '{\"role\":\"admin\"}')"
 PYTHONPATH=. python3 -m novadb /tmp/novadb-demo --sql "SELECT name, JSON_EXTRACT(profile, '$.role') AS role FROM users"
+PYTHONPATH=. python3 -m novadb /tmp/novadb-demo --compact
 ```
 
 For an interactive shell:
@@ -49,11 +52,47 @@ curl -X POST http://127.0.0.1:8765/query \
   -d '{"sql":"SELECT * FROM users"}'
 ```
 
-The HTTP service accepts JSON requests up to 1 MiB and defaults to 60 requests per minute per client address. A bearer token is required when binding beyond loopback; `/health` remains readable for liveness checks but exposes only a table count. These controls are intended for a private automation memory service, not as a substitute for TLS termination, an API gateway, or a production identity system.
+The HTTP service accepts JSON requests up to 1 MiB and defaults to 60 requests per minute per client address. A bearer token is required when binding beyond loopback; `/health` remains readable for liveness checks but exposes only a table count. Pass `--tls-cert` and `--tls-key` to enable server-side TLS; durable-mode requests are recorded in the local `http-audit.jsonl` file with request id, path, status, and client address. These controls are intended for a private automation memory service, not as a substitute for an external identity system, key rotation, an API gateway, or a security review.
+
+The same service exposes authenticated `POST /memory/upsert`, `/memory/search`,
+`/memory/recent`, and `/audit` routes. Memory records are scoped by namespace
+and session, capped in size, expire by TTL, and store caller-provided summaries
+rather than raw transcripts. Optional embeddings use an OpenAI-compatible
+`/embeddings` endpoint configured with `--embedding-url`; without one, bounded
+lexical/recent retrieval remains available. `GET /memory/health` reports only
+service capability flags.
 
 ### Prompt-to-SQL approval workflow
 
 Set `NOVADB_LLM_URL` to an OpenAI-compatible base URL such as the loopback Ollama endpoint on the host. `POST /prompt` sends the natural-language request plus structural schema to the configured planner and returns one bounded SQL statement, an explanation, risk classification, SHA-256 hash, policy version, active limits, and expiry. It does not execute the statement. A caller must show that preview to a human and then call `POST /prompt/approve` with `approved: true` and the exact `sql_sha256`; rejected, altered, blocked, expired, or multi-statement plans are not executed. Guardrails require explicit `LIMIT` values for reads, a `WHERE` clause for updates/deletes, and cap prompt size, SQL size, selected rows, inserted rows, mutation rows, explanation size, plan count, and undo snapshot size. Approved mutations receive an execution id and can be reversed or reapplied through `POST /prompt/undo` and `POST /prompt/redo`; restore is refused if another commit intervened. Authenticated operators can inspect the policy at `GET /prompt/governance` and redacted history at `GET /prompt/history`. Without an LLM URL, only a small safe fallback handles table-listing and bounded table previews.
+
+### Agent memory contract
+
+The HTTP service creates two durable tables, `agent_memory` and
+`agent_audit_events`, and exposes bounded endpoints for n8n and other agents:
+
+```bash
+curl -X POST http://127.0.0.1:8765/memory/upsert \
+  -H 'Authorization: Bearer replace-with-a-long-random-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"namespace":"hospital","session_id":"demo-session","kind":"care_summary","content":"Redacted summary: requested primary-care appointment.","metadata":{"department":"access"},"ttl_seconds":604800}'
+
+curl -X POST http://127.0.0.1:8765/memory/search \
+  -H 'Authorization: Bearer replace-with-a-long-random-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"namespace":"hospital","session_id":"demo-session","query_text":"primary-care appointment","limit":5}'
+```
+
+`/memory/recent` returns the latest non-expired summaries and `/audit` appends
+a structured event. Raw transcripts are not required by the contract; callers
+should send minimum-necessary, de-identified summaries. If an
+OpenAI-compatible embeddings base URL is configured with `--embedding-url` or
+`NOVADB_EMBEDDING_URL`, the service uses `NOVADB_EMBEDDING_MODEL` (default
+`bge-m3`) to create vectors and `/memory/search` performs semantic retrieval.
+Without that setting, retrieval remains safe and useful through recent or
+lexical matching. The Oracle service can keep both the model and NovaDB on the
+same private host by setting the existing `NOVADB_LLM_URL` to the local Oracle
+Ollama-compatible endpoint.
 
 ## Example: relational, JSON, and vector query
 
@@ -88,7 +127,7 @@ dimensions before a transaction can commit.
 
 ## Architecture
 
-NovaDB intentionally separates the engine into small layers. The SQL layer parses a bounded SQL grammar and evaluates expressions through a safe, non-`eval` expression interpreter. The prompt layer treats model output as untrusted: it validates one statement, applies a versioned resource policy, and requires exact-hash approval before execution. The transaction layer clones a snapshot of the catalog, applies changes privately, and commits only if the engine version is unchanged. The storage layer records committed operations in a checksummed page log before publishing the new snapshot; a bounded LRU buffer pool provides verified page reads and checkpoints publish both `state.json` and `catalog.json` atomically.
+NovaDB intentionally separates the engine into small layers. The SQL layer parses a bounded SQL grammar and evaluates expressions through a safe, non-`eval` expression interpreter. The prompt layer treats model output as untrusted: it validates one statement, applies a versioned resource policy, and requires exact-hash approval before execution. The transaction layer clones a snapshot of the catalog, applies changes privately, and commits only if the engine version is unchanged. The storage layer records committed operations in a checksummed page log before publishing the new snapshot; a bounded LRU buffer pool provides verified page reads, B+ tree-backed equality lookup is rebuilt deterministically from table state, and compaction rewrites the page log to a single recovery snapshot.
 
 The design makes the distributed extension explicit. A leader can expose ordered WAL records, while a follower can apply them in version order. This is useful as a reference protocol, but it does not pretend to provide consensus, fencing, quorum durability, split-brain prevention, or online re-sharding. Those are separate engineering obligations.
 
@@ -96,17 +135,17 @@ The design makes the distributed extension explicit. A leader can expose ordered
 |---|---|---|
 | SQL | Bounded parser, expression evaluator, prepared statements, and cost-based inner-join plans | Broader SQL coverage, window functions, and a fuller logical/physical planner |
 | Execution | Row scans with aggregate pipeline | Columnar batches, late materialization, parallel operators |
-| Storage | JSON state image plus checksummed page log, page reads, LRU buffer pool, catalog sidecar | Slotted pages, durable B+ trees, compaction |
+| Storage | JSON state image plus checksummed page log, page reads, LRU buffer pool, catalog sidecar, compactable recovery snapshot, B+ tree-backed lookup | Slotted pages, durable on-disk B+ tree pages, crash-injection matrix |
 | Transactions | Snapshot copy plus optimistic version check | MVCC timestamps, lock manager, serializable validation |
-| Indexes | In-memory equality index metadata and exact vector distance | Durable B+ tree, statistics catalog, and vector ANN index |
+| Indexes | In-memory equality metadata plus B+ tree-backed lookup and deterministic vector ANN-style index | Durable on-disk trees, statistics catalog, deletes/range maintenance, and production ANN backend |
 | Replication | Ordered WAL replay plus deterministic Raft-style reference layer | Real transport, durable quorum acknowledgements, leases, and membership changes |
-| Service | Threaded HTTP JSON endpoint with bearer auth, JSON-only input, abuse limits, request IDs, and redacted 500s | TLS/identity integration, durable quotas, auditing, observability |
+| Service | Threaded HTTP JSON endpoint with bearer auth, abuse limits, request IDs, redacted 500s, optional TLS, local request audit, and bounded agent-memory routes | External identity, key rotation, durable quotas, centralized audit, and observability |
 
 ## Correctness and durability model
 
 A committed write is appended to the WAL, flushed, and then made visible to the engine snapshot. A transaction that begins against version `v` cannot commit after another transaction has advanced the database to a later version; it receives `TransactionConflict` and must be retried by the caller. This is deliberately conservative and easy to reason about, but it copies the whole catalog for each transaction and is therefore not suitable for high-concurrency production workloads.
 
-The recovery path loads the last checkpoint and replays only WAL records newer than its version. Checkpoint replacement uses a temporary file followed by an atomic rename. A production engine would additionally need checksummed WAL frames, torn-write detection, fsync policy controls, crash-injection tests, and a formally specified recovery protocol.
+The recovery path loads the last checkpoint and replays only page-log records newer than its version. Checkpoint and compaction replacement use a temporary file followed by an atomic rename; page headers and record frames reject torn or checksum-invalid tails. A production engine would additionally need checksummed WAL frames, crash-injection tests across each fsync boundary, MVCC recovery rules, and a formally specified recovery protocol.
 
 ## Throughput optimizations
 
@@ -120,8 +159,10 @@ single-page reads, and atomic checkpoint support. `PageBufferPool` adds a
 bounded LRU cache over those reads, while `catalog.json` provides an inspectable
 schema/index sidecar. On-disk commits use the page log as the authoritative
 versioned commit stream; the legacy newline WAL remains available as a
-compatibility fallback. Slotted records, durable B+ tree pages, compaction, and
-crash-injection recovery remain separate work.
+compatibility fallback. Table equality indexes use B+ tree structure in memory
+and rebuild from durable state; `Engine.compact()` rewrites the page log to a
+single deterministic recovery record. Slotted records, durable on-disk B+ tree
+pages, and crash-injection recovery remain separate work.
 
 `Engine.prepare(sql)` returns a reusable prepared statement. `executemany` performs one validated batch insert through the direct bulk loader. Simple prepared `SELECT` projections and predicates are compiled into a small stack-machine bytecode program with column loads, constants, parameters, function calls, arithmetic, comparisons, null checks, and boolean operators.
 
@@ -154,7 +195,7 @@ The reusable agent workflow for extending NovaDB is available at `/home/ubuntu/s
 
 ## Validation
 
-The repository includes a dependency-free regression runner covering SQL execution, JSON extraction, strict structured/document vector validation, grouped aggregation, durability and recovery, optimistic conflicts, WAL follower replay, page checksums and reads, buffer-pool hits, durable catalog publication, prompt policy exposure, prepared batch inserts, bytecode queries, multi-table joins, optimizer plan selection through both API and CLI, Raft election and quorum commit, minority partition rejection, and replicated NovaDB commands.
+The repository includes a dependency-free regression runner covering SQL execution, JSON extraction, strict structured/document vector validation, grouped aggregation, durability and recovery, optimistic conflicts, WAL follower replay, page checksums and reads, buffer-pool hits, durable catalog publication, B+ tree splits and indexed equality lookup, compaction/reopen recovery, deterministic vector nearest-neighbor ranking, prompt policy exposure, bounded agent-memory/embedding retrieval, authenticated memory HTTP routes, prepared batch inserts, bytecode queries, multi-table joins, optimizer plan selection through both API and CLI, Raft election and quorum commit, minority partition rejection, and replicated NovaDB commands.
 
 ```bash
 cd /home/ubuntu/novadb
@@ -170,7 +211,7 @@ PYTHONPATH=. python3 benchmarks/bench.py
 
 ## Roadmap toward an enterprise-grade engine
 
-The completed milestone closes the prompt-governance, vector-type, page-read/cache, catalog, and HTTP-hardening priorities at prototype scope. The next serious engineering gates are durable B+ tree pages and compaction, crash-injection recovery, row-version MVCC with serializable validation, vector ANN indexing, TLS/identity/audit integration, real consensus transport, and HIL validation against selected hardware. Each needs independent tests and failure evidence before it can be called production-ready.
+The completed milestone closes the prompt-governance, vector-type, page-read/cache, catalog, B+ tree lookup, compaction, deterministic vector-index, optional TLS, and local audit priorities at prototype scope. The next serious engineering gates are durable on-disk B+ tree pages, slotted-page allocation, crash-injection recovery, row-version MVCC with serializable validation, production ANN benchmarking, external identity/key management, real consensus transport, backup/restore drills, and workload evidence. Each needs independent tests and failure evidence before it can be called production-ready.
 
 The phrase “better than Oracle” should therefore be evaluated by workload and dimension. NovaDB can plausibly aim to be better for a narrow set of developer-centric embedded workloads because it is smaller and more integrated. It should not claim superiority for enterprise breadth, operational maturity, or global distributed guarantees until those properties are implemented and independently measured.
 

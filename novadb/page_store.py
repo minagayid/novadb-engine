@@ -118,6 +118,9 @@ class PageStore:
         if temporary.exists():
             temporary.unlink()
         replacement = PageStore(temporary, self.page_size)
-        replacement.append_records(records)
+        if records:
+            replacement.append_records(records)
+        else:
+            temporary.touch()
         temporary.replace(self.path)
         self._next_page_id = replacement.next_page_id

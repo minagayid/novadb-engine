@@ -5,14 +5,17 @@ import hmac
 import json
 import os
 import re
+import ssl
 import threading
 import time
 import uuid
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 from .engine import Engine, NovaDBError
+from .memory import MemoryStore, MemoryValidationError, OpenAICompatibleEmbedder
 from .prompting import OpenAICompatiblePlanner, PromptSQLService
 
 
@@ -22,6 +25,8 @@ class NovaHandler(BaseHTTPRequestHandler):
     token: str | None = None
     max_body_bytes = 1_048_576
     requests_per_minute = 60
+    audit_path: str | None = None
+    memory_store: MemoryStore | None = None
     _rate_lock = threading.Lock()
     _request_windows: dict[str, deque[float]] = defaultdict(deque)
 
@@ -39,6 +44,7 @@ class NovaHandler(BaseHTTPRequestHandler):
         extra_headers: dict[str, str] | None = None,
     ) -> None:
         request_id = request_id or self._request_id()
+        self._audit(status, request_id)
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -49,6 +55,27 @@ class NovaHandler(BaseHTTPRequestHandler):
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def _audit(self, status: int, request_id: str) -> None:
+        if self.audit_path is None:
+            return
+        entry = {
+            "timestamp": time.time(),
+            "request_id": request_id,
+            "method": self.command,
+            "path": self.path,
+            "status": status,
+            "client": self.client_address[0],
+        }
+        try:
+            with open(self.audit_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, separators=(",", ":")) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            # Audit persistence must not turn a safe request rejection into a
+            # server crash, but the failure remains visible through local logs.
+            return
 
     def _authorized(self) -> bool:
         if self.token is None:
@@ -81,7 +108,24 @@ class NovaHandler(BaseHTTPRequestHandler):
                 "llm_planner": bool(self.prompt_service and self.prompt_service.planner),
                 "prompt_guardrails": bool(self.prompt_service),
                 "prompt_undo_redo": bool(self.prompt_service),
+                "agent_memory": self.memory_store is not None,
+                "memory_embeddings": bool(self.memory_store and self.memory_store.embedder),
             })
+            return
+        if self.path == "/memory/health":
+            request_id = self._request_id()
+            if not self._rate_allowed():
+                self._send(429, {"ok": False, "error": "rate limit exceeded"}, request_id, {"Retry-After": "60"})
+                return
+            if not self._authorized():
+                self._send(401, {"ok": False, "error": "authentication required"}, request_id)
+                return
+            self._send(200, {
+                "ok": True,
+                "service": "novadb-agent-memory",
+                "storage": "durable-novadb",
+                "embeddings": bool(self.memory_store and self.memory_store.embedder),
+            }, request_id)
             return
         if self.path in {"/prompt/governance", "/prompt/history"}:
             request_id = self._request_id()
@@ -100,7 +144,7 @@ class NovaHandler(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def do_POST(self) -> None:
-        if self.path not in {"/query", "/prompt", "/prompt/approve", "/prompt/undo", "/prompt/redo"}:
+        if self.path not in {"/query", "/prompt", "/prompt/approve", "/prompt/undo", "/prompt/redo", "/memory/upsert", "/memory/search", "/memory/recent", "/audit"}:
             self._send(404, {"error": "not found"})
             return
         request_id = self._request_id()
@@ -108,10 +152,7 @@ class NovaHandler(BaseHTTPRequestHandler):
             self._send(429, {"ok": False, "error": "rate limit exceeded"}, request_id, {"Retry-After": "60"})
             return
         if not self._authorized():
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", "Bearer")
-            self.send_header("X-Request-ID", request_id)
-            self.end_headers()
+            self._send(401, {"ok": False, "error": "authentication required"}, request_id, {"WWW-Authenticate": "Bearer"})
             return
         try:
             content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
@@ -135,6 +176,20 @@ class NovaHandler(BaseHTTPRequestHandler):
                     raise ValueError("sql must be a string")
                 result = self.engine.execute(sql)
                 self._send(200, {"ok": True, "result": result}, request_id)
+                return
+            if self.memory_store is None:
+                raise NovaDBError("Agent memory is not configured")
+            if self.path == "/memory/upsert":
+                self._send(200, {"ok": True, "result": self.memory_store.upsert(payload)}, request_id)
+                return
+            if self.path == "/memory/search":
+                self._send(200, {"ok": True, "result": self.memory_store.search(payload)}, request_id)
+                return
+            if self.path == "/memory/recent":
+                self._send(200, {"ok": True, "result": self.memory_store.recent(payload)}, request_id)
+                return
+            if self.path == "/audit":
+                self._send(200, {"ok": True, "result": self.memory_store.audit(payload)}, request_id)
                 return
             if self.prompt_service is None:
                 raise NovaDBError("Prompt-to-SQL is not configured")
@@ -173,24 +228,44 @@ def serve(
     llm_url: str | None = None,
     llm_token: str | None = None,
     llm_model: str = "qwen3:1.7b",
+    tls_cert: str | None = None,
+    tls_key: str | None = None,
+    embedding_url: str | None = None,
+    embedding_token: str | None = None,
+    embedding_model: str = "bge-m3",
+    memory_default_ttl: int = 7 * 24 * 60 * 60,
 ) -> None:
     if requests_per_minute < 1:
         raise ValueError("requests_per_minute must be positive")
     if max_body_bytes < 256:
         raise ValueError("max_body_bytes is too small")
+    if bool(tls_cert) != bool(tls_key):
+        raise ValueError("tls_cert and tls_key must be provided together")
     if host not in {"127.0.0.1", "localhost", "::1"} and not token:
         raise ValueError("a bearer token is required when binding NovaDB beyond loopback")
     engine = Engine(path)
     NovaHandler.engine = engine
     planner = OpenAICompatiblePlanner(llm_url, model=llm_model, token=llm_token) if llm_url else None
     NovaHandler.prompt_service = PromptSQLService(engine, planner=planner)
+    resolved_embedding_url = embedding_url or os.environ.get("NOVADB_EMBEDDING_URL") or llm_url
+    resolved_embedding_token = embedding_token or os.environ.get("NOVADB_EMBEDDING_TOKEN") or llm_token
+    resolved_embedding_model = os.environ.get("NOVADB_EMBEDDING_MODEL", embedding_model)
+    embedder = OpenAICompatibleEmbedder(resolved_embedding_url, model=resolved_embedding_model, token=resolved_embedding_token) if resolved_embedding_url else None
+    NovaHandler.memory_store = MemoryStore(engine, embedder=embedder, default_ttl_seconds=memory_default_ttl)
     NovaHandler.token = token
     NovaHandler.max_body_bytes = max_body_bytes
     NovaHandler.requests_per_minute = requests_per_minute
+    NovaHandler.audit_path = None if path == ":memory:" else str(Path(path) / "http-audit.jsonl")
     NovaHandler._request_windows.clear()
     server = ThreadingHTTPServer((host, port), NovaHandler)
     server.daemon_threads = True
-    print(f"NovaDB listening on http://{host}:{port}")
+    scheme = "http"
+    if tls_cert and tls_key:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(tls_cert, tls_key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        scheme = "https"
+    print(f"NovaDB listening on {scheme}://{host}:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -211,8 +286,14 @@ def main() -> None:
     parser.add_argument("--llm-url", default=os.environ.get("NOVADB_LLM_URL"), help="OpenAI-compatible chat endpoint base URL")
     parser.add_argument("--llm-token", default=os.environ.get("NOVADB_LLM_TOKEN"), help="Optional planner bearer token")
     parser.add_argument("--llm-model", default=os.environ.get("NOVADB_LLM_MODEL", "qwen3:1.7b"))
+    parser.add_argument("--tls-cert", help="TLS certificate PEM path")
+    parser.add_argument("--tls-key", help="TLS private key PEM path")
+    parser.add_argument("--embedding-url", default=os.environ.get("NOVADB_EMBEDDING_URL"), help="Optional OpenAI-compatible embeddings base URL")
+    parser.add_argument("--embedding-token", default=os.environ.get("NOVADB_EMBEDDING_TOKEN"), help="Optional embedding bearer token")
+    parser.add_argument("--embedding-model", default=os.environ.get("NOVADB_EMBEDDING_MODEL", "bge-m3"))
+    parser.add_argument("--memory-default-ttl", type=int, default=int(os.environ.get("NOVADB_MEMORY_DEFAULT_TTL", 7 * 24 * 60 * 60)))
     args = parser.parse_args()
-    serve(args.path, args.host, args.port, args.token, args.max_body_bytes, args.requests_per_minute, args.llm_url, args.llm_token, args.llm_model)
+    serve(args.path, args.host, args.port, args.token, args.max_body_bytes, args.requests_per_minute, args.llm_url, args.llm_token, args.llm_model, args.tls_cert, args.tls_key, args.embedding_url, args.embedding_token, args.embedding_model, args.memory_default_ttl)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from .optimizer import QueryExecutor, QueryPlanner, PlanNode, hash_join, nested_
 from .raft import ConsensusSafetyError, LogEntry, NotLeaderError, RaftCluster, RaftNode, RaftStorage, ReplicatedEngine
 from .page_store import PageCorruptionError, PageStore
 from .buffer_pool import BufferPoolStats, PageBufferPool
+from .btree import BPlusTree
 from .vector import VECTOR_TYPES, dense_vector, document_vector
 from .prepared import PreparedStatement
 from .engine import (
@@ -16,6 +17,8 @@ from .engine import (
     format_rows,
     vector_distance,
 )
+from .vector_index import VectorANNIndex, VectorMatch
+from .memory import MemoryStore, MemoryValidationError, OpenAICompatibleEmbedder
 
 __all__ = [
     "Column",
@@ -35,9 +38,15 @@ __all__ = [
     "PageStore",
     "BufferPoolStats",
     "PageBufferPool",
+    "BPlusTree",
     "VECTOR_TYPES",
     "dense_vector",
     "document_vector",
+    "VectorANNIndex",
+    "VectorMatch",
+    "MemoryStore",
+    "MemoryValidationError",
+    "OpenAICompatibleEmbedder",
     "PreparedStatement",
     "QueryExecutor",
     "QueryPlanner",

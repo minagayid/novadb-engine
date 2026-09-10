@@ -7,6 +7,8 @@ from novadb import Engine, TransactionConflict, vector_distance
 from novadb.catalog import read as read_catalog
 from novadb.prompting import PromptPolicy, PromptSQLService
 from novadb.replication import apply_records, stream_wal
+from novadb.memory import MemoryStore
+from tests.test_memory_api import test_http_memory_requires_auth_and_records_audit
 
 
 def test_sql_json_vector_and_analytics():
@@ -260,8 +262,51 @@ def test_replicated_engine():
         assert engine.execute("SELECT * FROM t") == [{"id": 1, "value": "consensus"}]
 
 
+def test_btree_compaction_and_vector_index():
+    from novadb import BPlusTree, VectorANNIndex
+
+    tree = BPlusTree(max_keys=3)
+    for value in range(40):
+        tree.insert(value, value)
+    assert tree.find(27) == [27]
+    assert [key for key, _ in tree.items()] == list(range(40))
+
+    index = VectorANNIndex(2)
+    index.add("origin", [0, 0])
+    index.add("x", [1, 0])
+    assert index.search([0.1, 0], limit=1)[0].key == "origin"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Engine(tmp)
+        db.execute("CREATE TABLE events (id INT PRIMARY KEY, value TEXT)")
+        db.execute("CREATE INDEX events_id ON events (id)")
+        db.execute("INSERT INTO events VALUES (1, 'one'), (2, 'two')")
+        result = db.compact()
+        assert result["status"] == "compacted"
+        db.close()
+        recovered = Engine(tmp)
+        assert recovered.execute("SELECT * FROM events WHERE id = 2") == [{"id": 2, "value": "two"}]
+        recovered.close()
+
+
+def test_agent_memory_contract():
+    store = MemoryStore(Engine(), embedder=lambda text: [1.0, 0.0] if "appointment" in text else [0.0, 1.0])
+    stored = store.upsert({
+        "namespace": "hospital",
+        "session_id": "session-1",
+        "kind": "care_summary",
+        "content": "Patient requested an appointment with primary care.",
+        "metadata": {"department": "access"},
+    })
+    result = store.search({"namespace": "hospital", "session_id": "session-1", "query_embedding": [1, 0], "limit": 5})
+    assert stored["embedding_stored"] is True
+    assert result["mode"] == "semantic"
+    assert result["memories"][0]["memory_id"] == stored["memory_id"]
+    assert store.recent({"namespace": "hospital", "session_id": "session-1"})["count"] == 1
+
+
 if __name__ == "__main__":
-    tests = [test_sql_json_vector_and_analytics, test_structured_and_unstructured_vectors_are_validated, test_durability_and_recovery, test_optimistic_conflict, test_replication_records, test_page_store, test_page_store_rejects_torn_tail, test_buffer_pool_and_durable_catalog, test_prompt_governance_exposes_limits_without_bypassing_approval, test_prompt_undo_redo_round_trip_is_version_guarded, test_prepared_statements_and_bytecode, test_cost_based_joins, test_explain_sql_uses_the_same_optimizer_as_engine_explain, test_cli_explain_exposes_the_cost_based_plan, test_raft_consensus, test_replicated_engine]
+    tests = [test_sql_json_vector_and_analytics, test_structured_and_unstructured_vectors_are_validated, test_durability_and_recovery, test_optimistic_conflict, test_replication_records, test_page_store, test_page_store_rejects_torn_tail, test_buffer_pool_and_durable_catalog, test_prompt_governance_exposes_limits_without_bypassing_approval, test_prompt_undo_redo_round_trip_is_version_guarded, test_prepared_statements_and_bytecode, test_cost_based_joins, test_explain_sql_uses_the_same_optimizer_as_engine_explain, test_cli_explain_exposes_the_cost_based_plan, test_raft_consensus, test_replicated_engine, test_btree_compaction_and_vector_index, test_agent_memory_contract, test_http_memory_requires_auth_and_records_audit]
     for test in tests:
         test()
         print(f"PASS {test.__name__}")

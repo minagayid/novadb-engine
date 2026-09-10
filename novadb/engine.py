@@ -15,6 +15,7 @@ from typing import Any, Iterable
 
 from .page_store import PageStore
 from .buffer_pool import PageBufferPool
+from .btree import BPlusTree
 from .catalog import write as write_catalog
 from .engine_errors import VectorTypeError
 from .vector import VECTOR_TYPES, dense_vector, document_vector, embedding
@@ -48,6 +49,11 @@ def _value_key(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return (type(value).__name__, value)
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _index_key(value: Any) -> str:
+    """Return a stable comparable representation for the B+ tree."""
+    return json.dumps(_value_key(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
 
 
 def _split_csv(text: str) -> list[str]:
@@ -426,6 +432,7 @@ class Table:
     indexes: dict[str, dict[str, list[int]]] = field(default_factory=dict)
     primary_keys: dict[str, set[str]] = field(default_factory=dict)
     column_map: dict[str, Column] = field(init=False, repr=False)
+    btree_indexes: dict[str, BPlusTree] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.column_map = {column.name: column for column in self.columns}
@@ -502,15 +509,26 @@ class Table:
         for row in self.rows:
             for name in self.primary_keys:
                 self.primary_keys[name].add(_value_key(row.get(name)))
+        self.btree_indexes = {}
         for name, index in self.indexes.items():
             index.clear()
+            tree = BPlusTree()
+            self.btree_indexes[name] = tree
             for pos, row in enumerate(self.rows):
                 key = _value_key(row.get(name))
                 index.setdefault(key, []).append(pos)
+                tree.insert(_index_key(row.get(name)), pos)
 
     def append_index_entries(self, pos: int, row: dict[str, Any]) -> None:
         for name, index in self.indexes.items():
             index.setdefault(_value_key(row.get(name)), []).append(pos)
+            self.btree_indexes.setdefault(name, BPlusTree()).insert(_index_key(row.get(name)), pos)
+
+    def lookup_index(self, column: str, value: Any) -> list[dict[str, Any]] | None:
+        tree = self.btree_indexes.get(column)
+        if tree is None:
+            return None
+        return [self.rows[pos] for pos in tree.find(_index_key(value))]
 
 
 def _prepare_many_rows(table: Table, column_names: list[str], values_groups: list[list[Any]]) -> tuple[list[dict[str, Any]], dict[str, set[Any]]]:
@@ -729,7 +747,13 @@ class Transaction:
 
     def select(self, table_name: str, projection: str = "*", where: str | None = None, group_by: list[str] | None = None, order_by: tuple[str, bool] | None = None, limit: int | None = None) -> list[dict[str, Any]]:
         table = self._table(table_name)
-        rows = table.rows if not where else [row for row in table.rows if eval_predicate(where, row)]
+        rows = table.rows
+        if where:
+            indexed_match = re.fullmatch(r"([A-Za-z_]\w*)\s*=\s*(.+)", where.strip(), re.DOTALL)
+            indexed_rows = None
+            if indexed_match:
+                indexed_rows = table.lookup_index(indexed_match.group(1), parse_value(indexed_match.group(2)))
+            rows = indexed_rows if indexed_rows is not None else [row for row in table.rows if eval_predicate(where, row)]
         expressions = _split_csv(projection)
         alias_map: dict[str, str] = {}
         for expression in expressions:
@@ -980,6 +1004,39 @@ class Engine:
             "catalog_present": self.catalog_file.exists(),
             "buffer_pool": self.buffer_pool.stats().to_dict(),
         }
+
+    def compact(self) -> dict[str, Any]:
+        """Rewrite the page log to one deterministic recovery snapshot."""
+        if self.memory:
+            return {"status": "skipped", "reason": "in_memory", "version": self.version}
+        assert self.page_store is not None
+        with self._lock:
+            operations: list[dict[str, Any]] = []
+            for name, table in sorted(self.tables.items()):
+                operations.append({
+                    "op": "create_table",
+                    "name": name,
+                    "columns": [column.__dict__ for column in table.columns],
+                })
+                if table.rows:
+                    operations.append({"op": "insert_many", "table": name, "rows": copy.deepcopy(table.rows)})
+                for column in sorted(table.indexes):
+                    operations.append({"op": "create_index", "table": name, "column": column})
+            self.checkpoint()
+            record = {
+                "txid": f"compact-{self.version}",
+                "version": self.version,
+                "operations": operations,
+                "ts": time.time(),
+            }
+            self.page_store.checkpoint([record] if operations else [])
+            return {
+                "status": "compacted",
+                "version": self.version,
+                "table_count": len(self.tables),
+                "row_count": sum(len(table.rows) for table in self.tables.values()),
+                "page_count": self.page_store.page_count,
+            }
 
     def close(self) -> None:
         self.checkpoint()

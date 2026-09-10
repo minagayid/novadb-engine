@@ -64,6 +64,7 @@ def main() -> None:
     parser.add_argument("path", nargs="?", default=":memory:", help="database directory, or :memory:")
     parser.add_argument("--sql", help="execute one SQL statement")
     parser.add_argument("--file", type=Path, help="execute semicolon-separated SQL script")
+    parser.add_argument("--compact", action="store_true", help="rewrite the durable page log")
     args = parser.parse_args()
     engine = Engine(args.path)
     try:
@@ -72,6 +73,8 @@ def main() -> None:
             print(format_rows(result) if isinstance(result, list) else json.dumps(result, indent=2, ensure_ascii=False))
         elif args.file:
             run_script(engine, args.file.read_text())
+        elif args.compact:
+            print(json.dumps(engine.compact(), indent=2, ensure_ascii=False))
         else:
             repl(engine)
     finally:

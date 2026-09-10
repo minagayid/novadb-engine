@@ -17,12 +17,13 @@ The result is a runnable foundation, not a credible claim of universal superiori
 | SQL | `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `SHOW TABLES`, and `EXPLAIN` | Regression runner passed |
 | Analytics | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP BY`, `ORDER BY`, and `LIMIT` | Grouped 10,000-row workload passed |
 | JSON | Native JSON values and `JSON_EXTRACT` path access | JSON query test passed |
-| Vectors | Strict dense `VECTOR` and text-plus-embedding `VECTOR_DOCUMENT`; cosine/L2 distance | Structured/document vector and nearest-vector tests passed |
+| Vectors | Strict dense `VECTOR` and text-plus-embedding `VECTOR_DOCUMENT`; cosine/L2 distance; deterministic ANN-style index with exact fallback | Structured/document vector and nearest-vector tests passed |
 | Durability | Append-only WAL, flush-before-publish commit, checkpointed state, replay after restart | Recovery test passed |
 | Transactions | Snapshot copy plus optimistic version validation | Conflict test passed |
-| Service interface | Threaded JSON HTTP server with bearer auth, body/rate limits, request IDs, and redacted internal errors | HTTP smoke test plus security regression coverage |
+| Service interface | Threaded JSON HTTP server with bearer auth, body/rate limits, request IDs, redacted internal errors, optional TLS, and local JSONL request audit | HTTP smoke test plus security regression coverage |
 | Prompt governance | Versioned policy, bounded single-statement plans, exact-hash approval, stale-plan rejection, bounded undo/redo, governance/history views | Prompt regression suite passed |
-| Storage boundary | Verified page reads, bounded LRU buffer pool, and atomic schema catalog sidecar | Page/cache/catalog regression passed |
+| Agent memory | Namespaced summaries, optional embeddings, TTL expiry, bounded retrieval, and authenticated audit events | Memory store and HTTP route regression passed |
+| Storage boundary | Verified page reads, bounded LRU buffer pool, atomic schema catalog sidecar, B+ tree-backed lookup, and page-log compaction | Page/cache/catalog, index, and compaction/reopen regression passed |
 | Replication direction | Ordered WAL stream and follower replay helper | Replication test passed |
 
 ## Measured benchmark
@@ -35,11 +36,11 @@ The included benchmark uses 10,000 rows with an integer key, text field, JSON se
 | Grouped aggregate | 0.1272 s | 0.0017 s | NovaDB is slower because its execution layer is an intentionally simple Python row pipeline |
 | Aggregate result | `a=5,000`, `b=5,000` | `a=5,000`, `b=5,000` | Results agree for the tested workload |
 
-The benchmark identifies optimization priorities rather than supporting a marketing conclusion. The remaining high-value steps are durable B+ trees, compaction, incremental transaction state, columnar batches, broader physical planning, and production security/operations; this milestone now supplies the page-read/cache and catalog boundaries needed to approach those steps.
+The benchmark identifies optimization priorities rather than supporting a marketing conclusion. The remaining high-value steps are slotted pages, durable on-disk B+ tree pages, crash-injection recovery, incremental transaction state, columnar batches, broader physical planning, and production security/operations; this milestone now supplies the page-read/cache, catalog, compaction, and lookup boundaries needed to approach those steps.
 
 ## Architecture delivered
 
-The engine is organized around explicit layers. The SQL layer parses a bounded grammar, evaluates expressions through a non-`eval` interpreter, and exposes cost-based inner-join plans through the Python API, SQL `EXPLAIN`, and the CLI. The prompt layer treats model output as untrusted and requires a human-visible preview plus exact hash approval. The transaction layer creates a snapshot, applies writes privately, and commits only when the engine version is unchanged. The storage layer appends committed operations to a checksummed page log before publishing the new state, with verified single-page reads through a bounded LRU buffer pool and an atomically published `catalog.json` schema sidecar. The service layer exposes the same engine through a JSON-only HTTP interface with basic edge controls.
+The engine is organized around explicit layers. The SQL layer parses a bounded grammar, evaluates expressions through a non-`eval` interpreter, and exposes cost-based inner-join plans through the Python API, SQL `EXPLAIN`, and the CLI. The prompt layer treats model output as untrusted and requires a human-visible preview plus exact hash approval. The transaction layer creates a snapshot, applies writes privately, and commits only when the engine version is unchanged. The storage layer appends committed operations to a checksummed page log before publishing the new state, with verified single-page reads through a bounded LRU buffer pool, B+ tree-backed equality lookup rebuilt from durable state, deterministic compaction, and an atomically published `catalog.json` schema sidecar. The service layer exposes the same engine through a JSON-only HTTP interface with basic edge controls, optional TLS, and local request auditing.
 
 The distributed extension is deliberately presented as a protocol boundary rather than a false guarantee. WAL records contain monotonically increasing versions and ordered operations. A follower can consume records after its last version and replay them. A production implementation must add consensus, fencing, quorum acknowledgement, checksums, split-brain handling, failure injection, and online re-sharding.
 
@@ -73,12 +74,16 @@ curl -X POST http://127.0.0.1:8765/query \
 | `novadb/engine.py` | Core engine, SQL execution, transactions, WAL, recovery, JSON, and vector functions |
 | `novadb/prompting.py` | Prompt-to-SQL approval architecture, policy limits, undo/redo, and governance history |
 | `novadb/vector.py` | Strict structured and unstructured/document vector normalization |
+| `novadb/vector_index.py` | Deterministic ANN-style candidate buckets with exact fallback |
+| `novadb/btree.py` | In-memory B+ tree used for deterministic equality lookup |
+| `novadb/memory.py` | Bounded agent-memory, optional embedding, and audit contract |
 | `novadb/buffer_pool.py` | Bounded LRU cache over verified page reads |
 | `novadb/catalog.py` | Atomic schema/index catalog sidecar |
 | `novadb/cli.py` | Interactive shell and script runner |
-| `novadb/server.py` | Local HTTP service |
+| `novadb/server.py` | Local HTTP service, optional TLS, memory routes, and request audit |
 | `novadb/replication.py` | WAL stream and follower replay helpers |
 | `tests/test_runner.py` | Dependency-free regression suite |
+| `tests/test_memory_api.py` | Agent-memory HTTP smoke coverage |
 | `tests/test_engine.py` | Optional pytest-style equivalent tests |
 | `benchmarks/bench.py` | Reproducible SQLite comparison workload |
 | `benchmark.json` | Captured benchmark output |
@@ -86,9 +91,9 @@ curl -X POST http://127.0.0.1:8765/query \
 
 ## Production gap assessment
 
-NovaDB should not yet be used as the sole store for irreplaceable data. It does not currently provide slotted-page allocation, durable B+ tree indexes, compaction, full MVCC timestamps, serializable isolation, TLS or an external identity/authorization system, encryption, durable audit storage, backups, durable consensus-backed replication, or a compatibility layer for enterprise SQL dialects. The current optimizer, joins, prepared statements, checksummed page log, LRU buffer pool, prompt governance, and Raft-style layer remain prototype/reference implementations.
+NovaDB should not yet be used as the sole store for irreplaceable data. It does not currently provide slotted-page allocation, durable on-disk B+ tree pages, full MVCC timestamps, serializable isolation, an external identity/authorization system, key management/encryption, centralized durable audit retention, backups, durable consensus-backed replication, or a compatibility layer for enterprise SQL dialects. The current optimizer, joins, prepared statements, checksummed page log, LRU buffer pool, prompt governance, compaction, vector index, and Raft-style layer remain prototype/reference implementations.
 
-The project is nevertheless a useful foundation because each limitation is explicit and mapped to a concrete subsystem. The next release should focus on durable B+ tree pages/compaction and crash-injection recovery, followed by row-version MVCC and serializable validation. Vector ANN indexing, TLS/identity/audit integration, and real consensus transport should follow only with independent failure evidence.
+The project is nevertheless a useful foundation because each limitation is explicit and mapped to a concrete subsystem. The next release should focus on slotted pages, durable B+ tree pages, and crash-injection recovery, followed by row-version MVCC and serializable validation. Production ANN benchmarking, external identity/key management, durable backups, and real consensus transport should follow only with independent failure evidence.
 
 ## Final decision
 
