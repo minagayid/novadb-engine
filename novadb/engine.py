@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .page_store import PageStore
+from .buffer_pool import PageBufferPool
+from .catalog import write as write_catalog
+from .engine_errors import VectorTypeError
+from .vector import VECTOR_TYPES, dense_vector, document_vector, embedding
 
 try:
     import numpy as np
@@ -206,8 +210,10 @@ def _json_path(value: Any, path: str) -> Any:
 
 def vector_distance(left: Any, right: Any, metric: str = "cosine") -> float | None:
     try:
-        a = [float(x) for x in left]
-        b = [float(x) for x in right]
+        a = embedding(left)
+        b = embedding(right)
+        if a is None or b is None:
+            return None
     except (TypeError, ValueError):
         return None
     if len(a) != len(b) or not a:
@@ -223,8 +229,8 @@ def vector_distance(left: Any, right: Any, metric: str = "cosine") -> float | No
 
 
 def _vector_argument(value: Any) -> Any:
-    """Accept SQL string literals containing JSON vectors as vector operands."""
-    if isinstance(value, str) and value.lstrip().startswith("["):
+    """Accept SQL string literals containing JSON vector operands."""
+    if isinstance(value, str) and value.lstrip().startswith(("[", "{")):
         try:
             parsed = json.loads(value)
         except json.JSONDecodeError:
@@ -440,6 +446,7 @@ class Table:
             if value is not None:
                 value = self._coerce(col, value)
             row[col.name] = value
+        self.validate_vector_dimensions([row])
         return row
 
     @staticmethod
@@ -464,14 +471,33 @@ class Table:
                 return json.loads(value)
             except json.JSONDecodeError:
                 raise ConstraintError(f"Invalid JSON for {col.name}")
-        if typ.startswith("VECTOR") and isinstance(value, str):
+        if typ == "VECTOR":
             try:
-                value = json.loads(value)
-            except json.JSONDecodeError:
-                raise ConstraintError(f"Invalid vector for {col.name}")
+                return dense_vector(value, col.name)
+            except VectorTypeError as exc:
+                raise ConstraintError(str(exc)) from exc
+        if typ in {"VECTOR_DOCUMENT", "VECTOR_DOC", "UNSTRUCTURED_VECTOR"}:
+            try:
+                return document_vector(value, col.name)
+            except VectorTypeError as exc:
+                raise ConstraintError(str(exc)) from exc
         return value
 
+    def validate_vector_dimensions(self, candidates: list[dict[str, Any]] | None = None) -> None:
+        rows = [*self.rows, *(candidates or [])]
+        for column in self.columns:
+            if column.type not in VECTOR_TYPES:
+                continue
+            dimensions = set()
+            for row in rows:
+                value = embedding(row.get(column.name))
+                if value is not None:
+                    dimensions.add(len(value))
+            if len(dimensions) > 1:
+                raise ConstraintError(f"Vector dimension mismatch for {column.name}")
+
     def rebuild_indexes(self) -> None:
+        self.validate_vector_dimensions()
         self.primary_keys = {column.name: set() for column in self.columns if column.primary_key}
         for row in self.rows:
             for name in self.primary_keys:
@@ -556,6 +582,7 @@ class Transaction:
     def insert_many(self, table_name: str, column_names: list[str], values_groups: list[list[Any]]) -> list[dict[str, Any]]:
         table = self._table(table_name)
         new_rows, pending_keys = _prepare_many_rows(table, column_names, values_groups)
+        table.validate_vector_dimensions(new_rows)
         table.rows.extend(new_rows)
         table.primary_keys = pending_keys
         if table.indexes:
@@ -569,6 +596,7 @@ class Transaction:
         if set(assignments) - names:
             raise ConstraintError(f"Unknown column(s): {', '.join(sorted(set(assignments) - names))}")
         count = 0
+        before_rows = copy.deepcopy(table.rows)
         for row in table.rows:
             if eval_predicate(where, row):
                 old = row.copy()
@@ -579,7 +607,12 @@ class Transaction:
                         raise ConstraintError(f"Column {col.name} cannot be NULL")
                 count += 1
                 self.operations.append({"op": "update", "table": table_name, "before": old, "after": row.copy()})
-        table.rebuild_indexes()
+        try:
+            table.rebuild_indexes()
+        except Exception:
+            table.rows = before_rows
+            table.rebuild_indexes()
+            raise
         return count
 
     def delete(self, table_name: str, where: str | None = None) -> int:
@@ -792,6 +825,8 @@ class Engine:
         self.state_file = None if self.memory else self.path / "state.json"
         self.wal_file = None if self.memory else self.path / "wal.log"
         self.page_store = None if self.memory else PageStore(self.path / "pages.dat")
+        self.buffer_pool = None if self.memory else PageBufferPool(self.page_store)
+        self.catalog_file = None if self.memory else self.path / "catalog.json"
         self.tables: dict[str, Table] = {}
         self.version = 0
         self._lock = threading.RLock()
@@ -805,7 +840,8 @@ class Engine:
             self.version = data.get("version", 0)
             self.tables = {name: _table_from_dict(table) for name, table in data.get("tables", {}).items()}
         if self.page_store is not None and self.page_store.path.exists():
-            for record in self.page_store.iter_records():
+            assert self.buffer_pool is not None
+            for record in self.buffer_pool.scan_records():
                 if record.get("version", 0) <= self.version:
                     continue
                 self._apply_operations(record["operations"])
@@ -888,6 +924,7 @@ class Engine:
                 raise NovaDBError(f"Table does not exist: {table_name}")
             table = self.tables[table_name]
             new_rows, pending_keys = _prepare_many_rows(table, column_names, values_groups)
+            table.validate_vector_dimensions(new_rows)
             operations = [{"op": "insert_many", "table": table_name, "rows": new_rows}]
             record = {"txid": uuid.uuid4().hex, "version": self.version + 1, "operations": operations, "ts": time.time()}
             if not self.memory:
@@ -925,7 +962,22 @@ class Engine:
         with tmp.open("rb+") as handle:
             os.fsync(handle.fileno())
         tmp.replace(self.state_file)
+        assert self.catalog_file is not None
+        write_catalog(self.catalog_file, self.version, self.tables)
         self.wal_file.write_text("")
+
+    def storage_status(self) -> dict[str, Any]:
+        """Expose bounded storage health without exposing internal file handles."""
+        if self.memory:
+            return {"mode": "memory", "version": self.version}
+        assert self.page_store is not None and self.buffer_pool is not None and self.catalog_file is not None
+        return {
+            "mode": "durable",
+            "version": self.version,
+            "page_count": self.page_store.page_count,
+            "catalog_present": self.catalog_file.exists(),
+            "buffer_pool": self.buffer_pool.stats().to_dict(),
+        }
 
     def close(self) -> None:
         self.checkpoint()

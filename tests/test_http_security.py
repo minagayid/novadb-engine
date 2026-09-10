@@ -105,3 +105,67 @@ def test_http_prompt_rejects_string_approval():
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
+
+def test_http_governance_is_authenticated_and_health_is_minimal():
+    token = "governance-token-123"
+    engine = Engine()
+    engine.execute("CREATE TABLE private_notes (id INT PRIMARY KEY, body TEXT)")
+    NovaHandler.engine = engine
+    NovaHandler.token = token
+    NovaHandler.prompt_service = PromptSQLService(engine, planner=lambda prompt, schema: {"sql": "SHOW TABLES"})
+    NovaHandler.max_body_bytes = 1_048_576
+    NovaHandler.requests_per_minute = 20
+    NovaHandler._request_windows.clear()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), NovaHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        status, health = _request(port, "GET", "/health")
+        assert status == 200
+        health_payload = json.loads(health)
+        assert "tables" not in health_payload
+        assert health_payload["table_count"] == 1
+        status, _ = _request(port, "GET", "/prompt/governance")
+        assert status == 401
+        status, raw = _request(port, "GET", "/prompt/governance", token=token)
+        assert status == 200
+        assert json.loads(raw)["policy_version"] == "prompt-sql/v2"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_http_internal_errors_are_redacted():
+    class BrokenEngine:
+        version = 0
+        tables = {}
+
+        def execute(self, sql):
+            raise RuntimeError("secret implementation detail")
+
+    token = "redaction-token-123"
+    NovaHandler.engine = BrokenEngine()
+    NovaHandler.token = token
+    NovaHandler.prompt_service = None
+    NovaHandler.max_body_bytes = 1_048_576
+    NovaHandler.requests_per_minute = 20
+    NovaHandler._request_windows.clear()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), NovaHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, raw = _request(server.server_address[1], "POST", "/query", {"sql": "SHOW TABLES"}, token)
+        assert status == 500
+        body = json.loads(raw)
+        assert body["error"] == "internal server error"
+        assert "secret implementation detail" not in raw.decode()
+        assert body["request_id"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)

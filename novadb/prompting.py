@@ -28,6 +28,35 @@ class PromptPlanningError(NovaDBError):
 
 _ALLOWED_PREFIX = re.compile(r"^(?:SELECT\b|SHOW\s+TABLES\b|EXPLAIN\b|CREATE\s+TABLE\b|CREATE\s+INDEX\b|INSERT\s+INTO\b|UPDATE\b|DELETE\s+FROM\b)", re.IGNORECASE)
 _BLOCKED_WORDS = re.compile(r"\b(PRAGMA|ATTACH|DETACH|VACUUM|LOAD|COPY|CALL|DROP|ALTER|TRUNCATE)\b", re.IGNORECASE)
+PROMPT_POLICY_VERSION = "prompt-sql/v2"
+
+
+@dataclass(frozen=True)
+class PromptPolicy:
+    """The explicit resource and mutation budget for model-proposed SQL."""
+
+    ttl_seconds: int = 900
+    max_prompt_chars: int = 2_000
+    max_sql_bytes: int = 4_000
+    max_explanation_chars: int = 1_000
+    max_select_rows: int = 1_000
+    max_insert_rows: int = 100
+    max_mutation_rows: int = 100
+    max_undo_snapshot_bytes: int = 1_048_576
+    history_limit: int = 10
+    max_plans: int = 1_000
+
+    def __post_init__(self) -> None:
+        for name in (
+            "ttl_seconds", "max_prompt_chars", "max_sql_bytes", "max_explanation_chars",
+            "max_select_rows", "max_insert_rows", "max_mutation_rows",
+            "max_undo_snapshot_bytes", "history_limit", "max_plans",
+        ):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be positive")
+
+    def to_dict(self) -> dict[str, int | str]:
+        return {"version": PROMPT_POLICY_VERSION, **asdict(self)}
 
 
 def _single_statement(sql: str) -> str:
@@ -52,6 +81,8 @@ def _single_statement(sql: str) -> str:
             quote = char
         elif char == ";":
             semicolons.append(index)
+    if quote:
+        raise PromptPlanningError("Unterminated SQL string literal")
     if semicolons and any(value[index + 1 :].strip() for index in semicolons):
         raise PromptPlanningError("Only one SQL statement may be proposed")
     value = value.rstrip(";").strip()
@@ -123,6 +154,8 @@ class PromptPlan:
     expires_at: float
     execution_id: str | None = None
     undo_available: bool = False
+    policy_version: str = PROMPT_POLICY_VERSION
+    guardrails: dict[str, int | str] | None = None
 
     def public(self) -> dict[str, Any]:
         return asdict(self)
@@ -213,21 +246,30 @@ class PromptSQLService:
         max_undo_snapshot_bytes: int = 1_048_576,
         history_limit: int = 10,
         max_plans: int = 1_000,
+        policy: PromptPolicy | None = None,
     ):
         self.engine = engine
         self.planner = planner
-        self.ttl_seconds = ttl_seconds
-        self.max_sql_chars = max_sql_chars
-        self.max_select_rows = max_select_rows
-        self.max_insert_rows = max_insert_rows
-        self.max_mutation_rows = max_mutation_rows
-        self.max_undo_snapshot_bytes = max_undo_snapshot_bytes
-        if max_plans < 1:
-            raise ValueError("max_plans must be positive")
-        self.max_plans = max_plans
+        self.policy = policy or PromptPolicy(
+            ttl_seconds=ttl_seconds,
+            max_sql_bytes=max_sql_chars,
+            max_select_rows=max_select_rows,
+            max_insert_rows=max_insert_rows,
+            max_mutation_rows=max_mutation_rows,
+            max_undo_snapshot_bytes=max_undo_snapshot_bytes,
+            history_limit=history_limit,
+            max_plans=max_plans,
+        )
+        self.ttl_seconds = self.policy.ttl_seconds
+        self.max_sql_chars = self.policy.max_sql_bytes
+        self.max_select_rows = self.policy.max_select_rows
+        self.max_insert_rows = self.policy.max_insert_rows
+        self.max_mutation_rows = self.policy.max_mutation_rows
+        self.max_undo_snapshot_bytes = self.policy.max_undo_snapshot_bytes
+        self.max_plans = self.policy.max_plans
         self._plans: dict[str, PromptPlan] = {}
-        self._history: deque[ExecutionRecord] = deque(maxlen=history_limit)
-        self._redo: deque[ExecutionRecord] = deque(maxlen=history_limit)
+        self._history: deque[ExecutionRecord] = deque(maxlen=self.policy.history_limit)
+        self._redo: deque[ExecutionRecord] = deque(maxlen=self.policy.history_limit)
 
     def _snapshot_for_undo(self, version: int, tables: dict[str, Any]) -> dict[str, Any]:
         """Copy a bounded snapshot so history cannot retain live table rows."""
@@ -292,14 +334,22 @@ class PromptSQLService:
 
     def preview(self, prompt: str) -> dict[str, Any]:
         prompt = str(prompt).strip()
-        if not prompt or len(prompt) > 2_000:
-            raise PromptPlanningError("Prompt must contain 1–2,000 characters")
+        if not prompt or len(prompt) > self.policy.max_prompt_chars:
+            raise PromptPlanningError(f"Prompt must contain 1–{self.policy.max_prompt_chars:,} characters")
         with self.engine._lock:
             schema = schema_snapshot(self.engine)
             schema_version = self.engine.version
         simple_table_request = re.search(r"\b(show|list|what)\b.*\b(table|tables)\b", prompt, re.IGNORECASE)
         proposed = self._fallback(prompt, schema) if simple_table_request else (self.planner(prompt, schema) if self.planner else self._fallback(prompt, schema))
-        sql = _single_statement(str(proposed.get("sql", "")))
+        if not isinstance(proposed, dict):
+            raise PromptPlanningError("The planner must return a JSON object")
+        raw_sql = proposed.get("sql")
+        if not isinstance(raw_sql, str):
+            raise PromptPlanningError("The planner response must contain a SQL string")
+        raw_explanation = proposed.get("explanation", "Review this statement before approval.")
+        if not isinstance(raw_explanation, str):
+            raise PromptPlanningError("The planner explanation must be a string")
+        sql = _single_statement(raw_sql)
         self._validate_task_budget(sql)
         _validate_table_references(sql, schema)
         risk, read_only = sql_risk(sql)
@@ -308,7 +358,7 @@ class PromptSQLService:
             plan_id=uuid.uuid4().hex,
             prompt=prompt,
             sql=sql,
-            explanation=str(proposed.get("explanation", "Review this statement before approval."))[:1_000],
+            explanation=raw_explanation[: self.policy.max_explanation_chars],
             risk=risk,
             read_only=read_only,
             sql_sha256=hashlib.sha256(sql.encode("utf-8")).hexdigest(),
@@ -317,11 +367,35 @@ class PromptSQLService:
             status="PENDING_APPROVAL",
             created_at=now,
             expires_at=now + self.ttl_seconds,
+            policy_version=PROMPT_POLICY_VERSION,
+            guardrails=self.policy.to_dict(),
         )
         with self.engine._lock:
             self._purge_plans(now)
             self._plans[plan.plan_id] = plan
         return plan.public()
+
+    def governance(self) -> dict[str, Any]:
+        """Return the non-secret prompt architecture and active guardrails."""
+        return {
+            "policy_version": PROMPT_POLICY_VERSION,
+            "approval_boundary": "preview -> exact hash approval -> single-use execution",
+            "planner_is_untrusted": True,
+            "undo_redo": "bounded in-memory snapshots with version-conflict protection",
+            "guardrails": self.policy.to_dict(),
+        }
+
+    def history(self) -> dict[str, list[dict[str, Any]]]:
+        """Return redacted execution history metadata for operators."""
+        def item(record: ExecutionRecord) -> dict[str, Any]:
+            return {
+                "execution_id": record.execution_id,
+                "plan_id": record.plan_id,
+                "sql_sha256": hashlib.sha256(record.sql.encode("utf-8")).hexdigest(),
+                "applied_version": record.applied_version,
+                "undone_version": record.undone_version,
+            }
+        return {"undoable": [item(record) for record in self._history], "redoable": [item(record) for record in self._redo]}
 
     def approve(self, plan_id: str, approved: bool, sql_sha256: str | None = None) -> dict[str, Any]:
         # Keep plan status, version validation, preflight, snapshot, and commit in one

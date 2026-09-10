@@ -4,8 +4,10 @@ import argparse
 import hmac
 import json
 import os
+import re
 import threading
 import time
+import uuid
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -23,11 +25,28 @@ class NovaHandler(BaseHTTPRequestHandler):
     _rate_lock = threading.Lock()
     _request_windows: dict[str, deque[float]] = defaultdict(deque)
 
-    def _send(self, status: int, payload: Any) -> None:
+    def _request_id(self) -> str:
+        supplied = self.headers.get("X-Request-ID", "")
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,80}", supplied):
+            return supplied
+        return uuid.uuid4().hex
+
+    def _send(
+        self,
+        status: int,
+        payload: Any,
+        request_id: str | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
+        request_id = request_id or self._request_id()
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Request-ID", request_id)
+        self.send_header("Cache-Control", "no-store")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -55,14 +74,24 @@ class NovaHandler(BaseHTTPRequestHandler):
             self._send(200, {
                 "status": "ok",
                 "version": self.engine.version,
-                "tables": sorted(self.engine.tables),
+                "table_count": len(self.engine.tables),
                 "authentication": self.token is not None,
                 "request_limit_per_minute": self.requests_per_minute,
-        "prompt_to_sql": self.prompt_service is not None,
-        "llm_planner": bool(self.prompt_service and self.prompt_service.planner),
-        "prompt_guardrails": bool(self.prompt_service),
-        "prompt_undo_redo": bool(self.prompt_service),
+                "prompt_to_sql": self.prompt_service is not None,
+                "llm_planner": bool(self.prompt_service and self.prompt_service.planner),
+                "prompt_guardrails": bool(self.prompt_service),
+                "prompt_undo_redo": bool(self.prompt_service),
             })
+            return
+        if self.path in {"/prompt/governance", "/prompt/history"}:
+            if not self._authorized():
+                self._send(401, {"ok": False, "error": "authentication required"})
+                return
+            if self.prompt_service is None:
+                self._send(422, {"ok": False, "error": "Prompt-to-SQL is not configured"})
+                return
+            payload = self.prompt_service.governance() if self.path.endswith("governance") else self.prompt_service.history()
+            self._send(200, {"ok": True, **payload})
             return
         self._send(404, {"error": "not found"})
 
@@ -70,17 +99,20 @@ class NovaHandler(BaseHTTPRequestHandler):
         if self.path not in {"/query", "/prompt", "/prompt/approve", "/prompt/undo", "/prompt/redo"}:
             self._send(404, {"error": "not found"})
             return
+        request_id = self._request_id()
+        if not self._rate_allowed():
+            self._send(429, {"ok": False, "error": "rate limit exceeded"}, request_id, {"Retry-After": "60"})
+            return
         if not self._authorized():
             self.send_response(401)
             self.send_header("WWW-Authenticate", "Bearer")
-            self.end_headers()
-            return
-        if not self._rate_allowed():
-            self.send_response(429)
-            self.send_header("Retry-After", "60")
+            self.send_header("X-Request-ID", request_id)
             self.end_headers()
             return
         try:
+            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                raise ValueError("Content-Type must be application/json")
             raw_length = self.headers.get("Content-Length")
             if raw_length is None:
                 raise ValueError("Content-Length is required")
@@ -91,29 +123,37 @@ class NovaHandler(BaseHTTPRequestHandler):
             if len(body) != length:
                 raise ValueError("incomplete request body")
             payload = json.loads(body)
+            if not isinstance(payload, dict):
+                raise ValueError("request JSON must be an object")
             if self.path == "/query":
                 sql = payload["sql"]
+                if not isinstance(sql, str):
+                    raise ValueError("sql must be a string")
                 result = self.engine.execute(sql)
-                self._send(200, {"ok": True, "result": result})
+                self._send(200, {"ok": True, "result": result}, request_id)
                 return
             if self.prompt_service is None:
                 raise NovaDBError("Prompt-to-SQL is not configured")
             if self.path == "/prompt":
-                self._send(200, {"ok": True, "plan": self.prompt_service.preview(payload["prompt"])})
+                prompt = payload["prompt"]
+                if not isinstance(prompt, str):
+                    raise ValueError("prompt must be a string")
+                self._send(200, {"ok": True, "plan": self.prompt_service.preview(prompt)}, request_id)
                 return
             if self.path == "/prompt/undo":
-                self._send(200, self.prompt_service.undo(payload.get("execution_id")))
+                self._send(200, self.prompt_service.undo(payload.get("execution_id")), request_id)
                 return
             if self.path == "/prompt/redo":
-                self._send(200, self.prompt_service.redo(payload.get("execution_id")))
+                self._send(200, self.prompt_service.redo(payload.get("execution_id")), request_id)
                 return
-            self._send(200, self.prompt_service.approve(payload["plan_id"], payload.get("approved"), payload.get("sql_sha256")))
+            self._send(200, self.prompt_service.approve(payload["plan_id"], payload.get("approved"), payload.get("sql_sha256")), request_id)
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
-            self._send(400, {"ok": False, "error": str(exc)})
+            self._send(400, {"ok": False, "error": str(exc), "request_id": request_id}, request_id)
         except NovaDBError as exc:
-            self._send(422, {"ok": False, "error": str(exc)})
-        except Exception as exc:
-            self._send(500, {"ok": False, "error": str(exc)})
+            self._send(422, {"ok": False, "error": str(exc), "request_id": request_id}, request_id)
+        except Exception:
+            # Do not turn database/parser internals into a remote information leak.
+            self._send(500, {"ok": False, "error": "internal server error", "request_id": request_id}, request_id)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return

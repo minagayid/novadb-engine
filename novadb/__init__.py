@@ -2,6 +2,8 @@ from .bytecode import BytecodeProgram, Instruction, compile_expression, compile_
 from .optimizer import QueryExecutor, QueryPlanner, PlanNode, hash_join, nested_loop_join
 from .raft import ConsensusSafetyError, LogEntry, NotLeaderError, RaftCluster, RaftNode, RaftStorage, ReplicatedEngine
 from .page_store import PageCorruptionError, PageStore
+from .buffer_pool import BufferPoolStats, PageBufferPool
+from .vector import VECTOR_TYPES, dense_vector, document_vector
 from .prepared import PreparedStatement
 from .engine import (
     Column,
@@ -31,6 +33,11 @@ __all__ = [
     "compile_predicate",
     "PageCorruptionError",
     "PageStore",
+    "BufferPoolStats",
+    "PageBufferPool",
+    "VECTOR_TYPES",
+    "dense_vector",
+    "document_vector",
     "PreparedStatement",
     "QueryExecutor",
     "QueryPlanner",

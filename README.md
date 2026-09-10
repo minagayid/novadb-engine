@@ -12,11 +12,12 @@ It is **not** an honest claim to replace Oracle across every enterprise workload
 | SQL DDL/DML | Working | `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `EXPLAIN` |
 | Analytical SQL | Working | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP BY`, `ORDER BY`, `LIMIT` |
 | JSON data | Working | Native JSON values and `JSON_EXTRACT(value, '$.path')` |
-| Vector data | Working | Vector values and cosine/L2 distance functions |
+| Vector data | Working prototype | Strict dense `VECTOR` and text-plus-embedding `VECTOR_DOCUMENT` values with cosine/L2 distance |
 | Durability | Working | Append-only WAL, fsync before commit, checkpointed state |
 | Transaction isolation | Working prototype | Snapshot transactions with optimistic commit conflict detection |
-| HTTP access | Working prototype | `GET /health` and `POST /query`, optional bearer auth, body cap, and per-client rate limit |
-| Prompt-to-SQL | Working prototype | `POST /prompt` creates an expiring, hashed SQL preview; `POST /prompt/approve` executes only after explicit approval |
+| HTTP access | Working prototype | JSON-only requests, bearer auth off loopback, bounded bodies, per-client rate limits, request IDs, redacted internal errors |
+| Prompt-to-SQL | Governed prototype | Versioned policy, bounded SQL, exact-hash single-use approval, stale-plan rejection, and bounded undo/redo |
+| Storage boundary | Working prototype | Checksummed page reads, bounded LRU buffer pool, and an atomically published schema catalog sidecar |
 | Replication | Reference primitive | Ordered WAL stream and follower replay helper |
 | Enterprise hardening | Not complete | Encryption, auditing, backups, and production consensus remain future work; the HTTP edge now has basic auth and abuse limits |
 
@@ -48,11 +49,11 @@ curl -X POST http://127.0.0.1:8765/query \
   -d '{"sql":"SELECT * FROM users"}'
 ```
 
-The HTTP service caps JSON requests at 1 MiB and defaults to 60 requests per minute per client address. A bearer token is required when binding beyond loopback; `/health` remains readable for liveness checks. These controls are intended for a private Oracle-hosted automation memory service, not as a substitute for a production API gateway.
+The HTTP service accepts JSON requests up to 1 MiB and defaults to 60 requests per minute per client address. A bearer token is required when binding beyond loopback; `/health` remains readable for liveness checks but exposes only a table count. These controls are intended for a private automation memory service, not as a substitute for TLS termination, an API gateway, or a production identity system.
 
 ### Prompt-to-SQL approval workflow
 
-Set `NOVADB_LLM_URL` to an OpenAI-compatible base URL such as the loopback Ollama endpoint on the Oracle host. `POST /prompt` sends the natural-language request plus structural schema to the configured planner and returns one bounded SQL statement, an explanation, risk classification, SHA-256 hash, and expiry. It does not execute the statement. A caller must show that preview to a human and then call `POST /prompt/approve` with `approved: true` and the exact `sql_sha256`; rejected, altered, blocked, expired, or multi-statement plans are not executed. Guardrails require explicit `LIMIT` values for reads, a `WHERE` clause for updates/deletes, and cap SQL size, selected rows, and inserted rows. Approved mutations receive an execution id and can be reversed or reapplied through `POST /prompt/undo` and `POST /prompt/redo`; restore is refused if another commit intervened. Without an LLM URL, only a small safe fallback handles table-listing and bounded table previews.
+Set `NOVADB_LLM_URL` to an OpenAI-compatible base URL such as the loopback Ollama endpoint on the host. `POST /prompt` sends the natural-language request plus structural schema to the configured planner and returns one bounded SQL statement, an explanation, risk classification, SHA-256 hash, policy version, active limits, and expiry. It does not execute the statement. A caller must show that preview to a human and then call `POST /prompt/approve` with `approved: true` and the exact `sql_sha256`; rejected, altered, blocked, expired, or multi-statement plans are not executed. Guardrails require explicit `LIMIT` values for reads, a `WHERE` clause for updates/deletes, and cap prompt size, SQL size, selected rows, inserted rows, mutation rows, explanation size, plan count, and undo snapshot size. Approved mutations receive an execution id and can be reversed or reapplied through `POST /prompt/undo` and `POST /prompt/redo`; restore is refused if another commit intervened. Authenticated operators can inspect the policy at `GET /prompt/governance` and redacted history at `GET /prompt/history`. Without an LLM URL, only a small safe fallback handles table-listing and bounded table previews.
 
 ## Example: relational, JSON, and vector query
 
@@ -61,13 +62,14 @@ CREATE TABLE documents (
     id INT PRIMARY KEY,
     title TEXT NOT NULL,
     metadata JSON,
-    embedding VECTOR
+    embedding VECTOR,
+    document VECTOR_DOCUMENT
 );
 
 INSERT INTO documents VALUES
-    (1, 'alpha', '{"team":"red","tier":2}', '[1,0]'),
-    (2, 'beta',  '{"team":"blue","tier":1}', '[0,1]'),
-    (3, 'gamma', '{"team":"red","tier":1}', '[0.8,0.2]');
+    (1, 'alpha', '{"team":"red","tier":2}', '[1,0]', '{"text":"alpha note","embedding":[1,0],"metadata":{"kind":"note"}}'),
+    (2, 'beta',  '{"team":"blue","tier":1}', '[0,1]', '{"text":"beta note","embedding":[0,1],"metadata":{"kind":"note"}}'),
+    (3, 'gamma', '{"team":"red","tier":1}', '[0.8,0.2]', '{"text":"gamma note","embedding":[0.8,0.2],"metadata":{"kind":"note"}}');
 
 SELECT
     title,
@@ -78,9 +80,15 @@ ORDER BY distance
 LIMIT 2;
 ```
 
+`VECTOR` stores a finite, non-empty dense numeric array and enforces one
+dimension per column. `VECTOR_DOCUMENT` stores bounded text, an embedding, and
+optional JSON metadata; distance functions use its `embedding` member. Both
+types reject malformed JSON, non-finite components, booleans, and oversized
+dimensions before a transaction can commit.
+
 ## Architecture
 
-NovaDB intentionally separates the engine into small layers. The SQL layer parses a bounded SQL grammar and evaluates expressions through a safe, non-`eval` expression interpreter. The transaction layer clones a snapshot of the catalog, applies changes privately, and commits only if the engine version is unchanged. The storage layer records committed operations in a newline-delimited WAL before publishing the new snapshot. Checkpoints atomically replace `state.json` and truncate the WAL after a durable state image has been written.
+NovaDB intentionally separates the engine into small layers. The SQL layer parses a bounded SQL grammar and evaluates expressions through a safe, non-`eval` expression interpreter. The prompt layer treats model output as untrusted: it validates one statement, applies a versioned resource policy, and requires exact-hash approval before execution. The transaction layer clones a snapshot of the catalog, applies changes privately, and commits only if the engine version is unchanged. The storage layer records committed operations in a checksummed page log before publishing the new snapshot; a bounded LRU buffer pool provides verified page reads and checkpoints publish both `state.json` and `catalog.json` atomically.
 
 The design makes the distributed extension explicit. A leader can expose ordered WAL records, while a follower can apply them in version order. This is useful as a reference protocol, but it does not pretend to provide consensus, fencing, quorum durability, split-brain prevention, or online re-sharding. Those are separate engineering obligations.
 
@@ -88,11 +96,11 @@ The design makes the distributed extension explicit. A leader can expose ordered
 |---|---|---|
 | SQL | Bounded parser, expression evaluator, prepared statements, and cost-based inner-join plans | Broader SQL coverage, window functions, and a fuller logical/physical planner |
 | Execution | Row scans with aggregate pipeline | Columnar batches, late materialization, parallel operators |
-| Storage | JSON state image plus checksummed page log and append-only WAL fallback | Buffer pool, slotted pages, B+ trees, compaction |
+| Storage | JSON state image plus checksummed page log, page reads, LRU buffer pool, catalog sidecar | Slotted pages, durable B+ trees, compaction |
 | Transactions | Snapshot copy plus optimistic version check | MVCC timestamps, lock manager, serializable validation |
 | Indexes | In-memory equality index metadata and exact vector distance | Durable B+ tree, statistics catalog, and vector ANN index |
 | Replication | Ordered WAL replay plus deterministic Raft-style reference layer | Real transport, durable quorum acknowledgements, leases, and membership changes |
-| Service | Threaded HTTP JSON endpoint with basic auth and abuse limits | Binary protocol, durable quotas, auditing, observability |
+| Service | Threaded HTTP JSON endpoint with bearer auth, JSON-only input, abuse limits, request IDs, and redacted 500s | TLS/identity integration, durable quotas, auditing, observability |
 
 ## Correctness and durability model
 
@@ -106,7 +114,14 @@ The engine now includes a direct atomic bulk-insert path, one-pass batch validat
 
 ## Page storage, bytecode, and prepared statements
 
-The next-phase architecture adds `PageStore`, a fixed-size 16 KiB page file with versioned headers, length-prefixed records, CRC32 checksums, sequential append, and atomic checkpoint support. On-disk commits use the page log as the authoritative versioned commit stream; the legacy newline WAL remains available as a compatibility fallback. The design provides the physical boundary needed for a future buffer pool and durable B+ tree.
+The page-oriented boundary uses a fixed-size 16 KiB page file with versioned
+headers, length-prefixed records, CRC32 checksums, sequential append, verified
+single-page reads, and atomic checkpoint support. `PageBufferPool` adds a
+bounded LRU cache over those reads, while `catalog.json` provides an inspectable
+schema/index sidecar. On-disk commits use the page log as the authoritative
+versioned commit stream; the legacy newline WAL remains available as a
+compatibility fallback. Slotted records, durable B+ tree pages, compaction, and
+crash-injection recovery remain separate work.
 
 `Engine.prepare(sql)` returns a reusable prepared statement. `executemany` performs one validated batch insert through the direct bulk loader. Simple prepared `SELECT` projections and predicates are compiled into a small stack-machine bytecode program with column loads, constants, parameters, function calls, arithmetic, comparisons, null checks, and boolean operators.
 
@@ -139,7 +154,7 @@ The reusable agent workflow for extending NovaDB is available at `/home/ubuntu/s
 
 ## Validation
 
-The repository includes a dependency-free regression runner covering SQL execution, JSON extraction, vector distance, grouped aggregation, durability and recovery, optimistic conflicts, WAL follower replay, page checksums, prepared batch inserts, bytecode queries, multi-table joins, optimizer plan selection through both API and CLI, Raft election and quorum commit, minority partition rejection, and replicated NovaDB commands.
+The repository includes a dependency-free regression runner covering SQL execution, JSON extraction, strict structured/document vector validation, grouped aggregation, durability and recovery, optimistic conflicts, WAL follower replay, page checksums and reads, buffer-pool hits, durable catalog publication, prompt policy exposure, prepared batch inserts, bytecode queries, multi-table joins, optimizer plan selection through both API and CLI, Raft election and quorum commit, minority partition rejection, and replicated NovaDB commands.
 
 ```bash
 cd /home/ubuntu/novadb
@@ -155,7 +170,7 @@ PYTHONPATH=. python3 benchmarks/bench.py
 
 ## Roadmap toward an enterprise-grade engine
 
-The next milestone is a real page-oriented storage manager with a buffer pool, durable catalog, and B+ tree indexes. The following milestone is a vectorized execution engine with columnar batches, statistics, and broader physical planning. Only after those foundations are stable should the system add MVCC timestamps, lock management, security, wire-protocol compatibility, durable consensus integration, and production operations.
+The completed milestone closes the prompt-governance, vector-type, page-read/cache, catalog, and HTTP-hardening priorities at prototype scope. The next serious engineering gates are durable B+ tree pages and compaction, crash-injection recovery, row-version MVCC with serializable validation, vector ANN indexing, TLS/identity/audit integration, real consensus transport, and HIL validation against selected hardware. Each needs independent tests and failure evidence before it can be called production-ready.
 
 The phrase “better than Oracle” should therefore be evaluated by workload and dimension. NovaDB can plausibly aim to be better for a narrow set of developer-centric embedded workloads because it is smaller and more integrated. It should not claim superiority for enterprise breadth, operational maturity, or global distributed guarantees until those properties are implemented and independently measured.
 

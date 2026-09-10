@@ -33,10 +33,17 @@ class PageStore:
     def _discover_next_page_id(self) -> int:
         if not self.path.exists():
             return 0
-        return self.path.stat().st_size // self.page_size
+        size = self.path.stat().st_size
+        if size % self.page_size:
+            raise PageCorruptionError("page file ends with a partial page")
+        return size // self.page_size
 
     @property
     def next_page_id(self) -> int:
+        return self._next_page_id
+
+    @property
+    def page_count(self) -> int:
         return self._next_page_id
 
     def append_records(self, records: list[dict[str, Any]], sync: bool = True) -> list[int]:
@@ -68,36 +75,43 @@ class PageStore:
         self._next_page_id = page_id + 1
         return [current_id for current_id, _ in pages]
 
-    def iter_records(self) -> Iterator[dict[str, Any]]:
-        if not self.path.exists():
-            return
+    def _read_block(self, page_id: int) -> bytes:
+        if page_id < 0 or page_id >= self.page_count:
+            raise PageCorruptionError(f"page {page_id} is not present")
         with self.path.open("rb") as handle:
-            page_id = 0
-            while True:
-                block = handle.read(self.page_size)
-                if not block:
-                    break
-                if len(block) != self.page_size:
-                    raise PageCorruptionError(f"truncated page {page_id}")
-                magic, version, stored_id, payload_length, checksum = HEADER.unpack(block[:HEADER_SIZE])
-                if magic != MAGIC or version != VERSION or stored_id != page_id:
-                    raise PageCorruptionError(f"invalid page header at {page_id}")
-                if payload_length > self.page_size - HEADER_SIZE:
-                    raise PageCorruptionError(f"invalid payload length at page {page_id}")
-                payload = block[HEADER_SIZE:HEADER_SIZE + payload_length]
-                if zlib.crc32(payload) & 0xFFFFFFFF != checksum:
-                    raise PageCorruptionError(f"checksum mismatch at page {page_id}")
-                offset = 0
-                while offset < len(payload):
-                    if offset + 4 > len(payload):
-                        raise PageCorruptionError(f"truncated record frame at page {page_id}")
-                    length = struct.unpack(">I", payload[offset:offset + 4])[0]
-                    offset += 4
-                    if offset + length > len(payload):
-                        raise PageCorruptionError(f"truncated record at page {page_id}")
-                    yield json.loads(payload[offset:offset + length])
-                    offset += length
-                page_id += 1
+            handle.seek(page_id * self.page_size)
+            block = handle.read(self.page_size)
+        if len(block) != self.page_size:
+            raise PageCorruptionError(f"truncated page {page_id}")
+        return block
+
+    def read_page(self, page_id: int) -> list[dict[str, Any]]:
+        """Decode and verify one page for a future buffer-pool consumer."""
+        block = self._read_block(page_id)
+        magic, version, stored_id, payload_length, checksum = HEADER.unpack(block[:HEADER_SIZE])
+        if magic != MAGIC or version != VERSION or stored_id != page_id:
+            raise PageCorruptionError(f"invalid page header at {page_id}")
+        if payload_length > self.page_size - HEADER_SIZE:
+            raise PageCorruptionError(f"invalid payload length at page {page_id}")
+        payload = block[HEADER_SIZE:HEADER_SIZE + payload_length]
+        if zlib.crc32(payload) & 0xFFFFFFFF != checksum:
+            raise PageCorruptionError(f"checksum mismatch at page {page_id}")
+        records: list[dict[str, Any]] = []
+        offset = 0
+        while offset < len(payload):
+            if offset + 4 > len(payload):
+                raise PageCorruptionError(f"truncated record frame at page {page_id}")
+            length = struct.unpack(">I", payload[offset:offset + 4])[0]
+            offset += 4
+            if offset + length > len(payload):
+                raise PageCorruptionError(f"truncated record at page {page_id}")
+            records.append(json.loads(payload[offset:offset + length]))
+            offset += length
+        return records
+
+    def iter_records(self) -> Iterator[dict[str, Any]]:
+        for page_id in range(self.page_count):
+            yield from self.read_page(page_id)
 
     def checkpoint(self, records: list[dict[str, Any]]) -> None:
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")

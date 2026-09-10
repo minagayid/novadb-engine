@@ -4,6 +4,8 @@ from pathlib import Path
 import subprocess
 import sys
 from novadb import Engine, TransactionConflict, vector_distance
+from novadb.catalog import read as read_catalog
+from novadb.prompting import PromptPolicy, PromptSQLService
 from novadb.replication import apply_records, stream_wal
 
 
@@ -19,6 +21,27 @@ def test_sql_json_vector_and_analytics():
     assert nearest["name"] == "alpha"
     assert abs(nearest["distance"]) < 1e-9
     assert abs(vector_distance([1, 0], [0, 1]) - 1.0) < 1e-9
+
+
+def test_structured_and_unstructured_vectors_are_validated():
+    db = Engine()
+    db.execute("CREATE TABLE memories (id INT PRIMARY KEY, embedding VECTOR, document VECTOR_DOCUMENT)")
+    db.execute("INSERT INTO memories VALUES (1, '[1,0]', '{\"text\":\"alpha note\",\"embedding\":[1,0],\"metadata\":{\"kind\":\"note\"}}')")
+    row = db.execute("SELECT JSON_EXTRACT(document, '$.text') AS text, VECTOR_DISTANCE(document, '[1,0]') AS distance FROM memories LIMIT 1")[0]
+    assert row["text"] == "alpha note", row
+    assert abs(row["distance"]) < 1e-9, row
+    try:
+        db.execute("INSERT INTO memories VALUES (2, '[1,0,0]', '{\"text\":\"bad dimension\",\"embedding\":[1,0],\"metadata\":{}}')")
+    except Exception as exc:
+        assert "dimension mismatch" in str(exc).lower(), exc
+    else:
+        raise AssertionError("mixed structured vector dimensions must be rejected")
+    try:
+        db.execute("INSERT INTO memories VALUES (3, '[NaN,0]', '{\"text\":\"bad\",\"embedding\":[1,0],\"metadata\":{}}')")
+    except Exception as exc:
+        assert "finite" in str(exc).lower(), exc
+    else:
+        raise AssertionError("non-finite vector components must be rejected")
 
 
 def test_durability_and_recovery():
@@ -74,6 +97,66 @@ def test_page_store():
         except PageCorruptionError:
             return
         raise AssertionError("expected checksum failure")
+
+
+def test_buffer_pool_and_durable_catalog():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "db"
+        db = Engine(path)
+        db.execute("CREATE TABLE notes (id INT PRIMARY KEY, body TEXT)")
+        db.execute("CREATE INDEX notes_id ON notes (id)")
+        db.execute("INSERT INTO notes VALUES (1, 'catalogued')")
+        db.close()
+        catalog = read_catalog(path / "catalog.json")
+        assert catalog["engine_version"] == 3, catalog
+        assert catalog["tables"]["notes"]["indexes"] == ["id"], catalog
+        recovered = Engine(path)
+        assert recovered.storage_status()["catalog_present"] is True
+        assert recovered.storage_status()["page_count"] >= 1
+        assert recovered.execute("SELECT * FROM notes LIMIT 1") == [{"id": 1, "body": "catalogued"}]
+        assert recovered.buffer_pool is not None
+        recovered.buffer_pool.read_page(0)
+        recovered.buffer_pool.read_page(0)
+        assert recovered.buffer_pool.stats().hits >= 1
+
+
+def test_prompt_governance_exposes_limits_without_bypassing_approval():
+    db = Engine()
+    service = PromptSQLService(
+        db,
+        planner=lambda prompt, schema: {"sql": "SHOW TABLES", "explanation": "read-only"},
+        policy=PromptPolicy(ttl_seconds=30, max_plans=4),
+    )
+    plan = service.preview("list tables")
+    assert plan["policy_version"] == "prompt-sql/v2"
+    assert plan["guardrails"]["max_plans"] == 4
+    governance = service.governance()
+    assert governance["planner_is_untrusted"] is True
+    assert "exact hash approval" in governance["approval_boundary"]
+    assert service.history() == {"undoable": [], "redoable": []}
+
+
+def test_prompt_undo_redo_round_trip_is_version_guarded():
+    db = Engine()
+    db.execute("CREATE TABLE notes (id INT PRIMARY KEY, body TEXT)")
+    service = PromptSQLService(
+        db,
+        planner=lambda prompt, schema: {"sql": f"INSERT INTO notes VALUES ({prompt}, 'note')"},
+    )
+    plan = service.preview("1")
+    execution = service.approve(plan["plan_id"], True, plan["sql_sha256"])
+    execution_id = execution["execution_id"]
+    assert service.history()["undoable"][0]["execution_id"] == execution_id
+    assert service.undo(execution_id)["status"] == "UNDONE"
+    assert service.history()["redoable"][0]["execution_id"] == execution_id
+    assert service.redo(execution_id)["status"] == "REDONE"
+    db.execute("INSERT INTO notes VALUES (2, 'outside change')")
+    try:
+        service.undo(execution_id)
+    except Exception as exc:
+        assert "concurrent commit" in str(exc).lower(), exc
+    else:
+        raise AssertionError("undo must refuse to restore across an intervening commit")
 
 
 def test_prepared_statements_and_bytecode():
@@ -166,7 +249,7 @@ def test_replicated_engine():
 
 
 if __name__ == "__main__":
-    tests = [test_sql_json_vector_and_analytics, test_durability_and_recovery, test_optimistic_conflict, test_replication_records, test_page_store, test_prepared_statements_and_bytecode, test_cost_based_joins, test_explain_sql_uses_the_same_optimizer_as_engine_explain, test_cli_explain_exposes_the_cost_based_plan, test_raft_consensus, test_replicated_engine]
+    tests = [test_sql_json_vector_and_analytics, test_structured_and_unstructured_vectors_are_validated, test_durability_and_recovery, test_optimistic_conflict, test_replication_records, test_page_store, test_buffer_pool_and_durable_catalog, test_prompt_governance_exposes_limits_without_bypassing_approval, test_prompt_undo_redo_round_trip_is_version_guarded, test_prepared_statements_and_bytecode, test_cost_based_joins, test_explain_sql_uses_the_same_optimizer_as_engine_explain, test_cli_explain_exposes_the_cost_based_plan, test_raft_consensus, test_replicated_engine]
     for test in tests:
         test()
         print(f"PASS {test.__name__}")
