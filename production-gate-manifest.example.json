@@ -1,0 +1,41 @@
+{
+  "checked_at_ns": 0,
+  "regression_tests": {
+    "passed": true,
+    "reproducible": true,
+    "revision_pinned": true
+  },
+  "durable_storage": {
+    "slotted_pages": true,
+    "durable_indexes": true,
+    "checksummed_frames": true
+  },
+  "crash_recovery": {
+    "fault_matrix_passed": false,
+    "reopen_verified": true,
+    "no_data_loss": true
+  },
+  "backup_restore": {
+    "checksums_verified": true,
+    "restore_reopened": true,
+    "restore_drill_passed": false
+  },
+  "sql_mvcc": {
+    "integrated": false,
+    "snapshot_reads": true,
+    "serializable_validation": true,
+    "recovery_rules": false
+  },
+  "identity_security": {
+    "least_privilege": true,
+    "rotation_tested": false,
+    "external_identity_reviewed": false
+  },
+  "operations": {
+    "encryption_key_management": false,
+    "durable_audit_retention": false,
+    "consensus_transport": false,
+    "observability": false
+  },
+  "independent_review": false
+}

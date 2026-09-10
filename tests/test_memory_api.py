@@ -2,7 +2,7 @@ import json
 import threading
 import http.client
 
-from novadb import Engine
+from novadb import Engine, IdentityStore
 from novadb.memory import MemoryStore
 from novadb.server import NovaHandler, ThreadingHTTPServer
 
@@ -60,6 +60,34 @@ def test_http_memory_requires_auth_and_records_audit():
         status, body = _request(port, "POST", "/audit", {"session_id": "s", "event_type": "ROUTED", "decision": "review", "payload": {"department": "records"}}, token)
         assert status == 200
         assert body["result"]["event_type"] == "ROUTED"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_http_identity_roles_block_reader_mutations():
+    token_store = IdentityStore()
+    _, reader_token = token_store.issue("reader", role="reader")
+    NovaHandler.engine = Engine()
+    NovaHandler.token = None
+    NovaHandler.identity_store = token_store
+    NovaHandler.memory_store = MemoryStore(NovaHandler.engine)
+    NovaHandler.prompt_service = None
+    NovaHandler.max_body_bytes = 1_048_576
+    NovaHandler.requests_per_minute = 20
+    NovaHandler._request_windows.clear()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), NovaHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        status, _ = _request(port, "POST", "/query", {"sql": "CREATE TABLE blocked (id INT)"}, reader_token)
+        assert status == 403
+        status, body = _request(port, "POST", "/query", {"sql": "SHOW TABLES"}, reader_token)
+        assert status == 200
+        assert body["ok"] is True
     finally:
         server.shutdown()
         server.server_close()

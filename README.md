@@ -16,12 +16,13 @@ It is **not** an honest claim to replace Oracle across every enterprise workload
 | Durability | Working | Append-only WAL, fsync before commit, checkpointed state |
 | Transaction isolation | Working prototype | Snapshot transactions with optimistic commit conflict detection |
 | HTTP access | Working prototype | JSON-only requests, bearer auth off loopback, bounded bodies, per-client rate limits, request IDs, redacted internal errors, optional TLS, and JSONL request audit |
-| Agent memory API | Working prototype | Authenticated redacted-summary storage, TTL retrieval, optional semantic search, and structured audit events |
 | Prompt-to-SQL | Governed prototype | Versioned policy, bounded SQL, exact-hash single-use approval, stale-plan rejection, and bounded undo/redo |
-| Agent memory | Working prototype | Namespaced summary memory, optional local embeddings, bounded semantic/lexical retrieval, TTL expiry, and authenticated audit events |
-| Storage boundary | Working prototype | Checksummed page reads, bounded LRU buffer pool, schema catalog sidecar, B+ tree-backed equality lookup, and page-log compaction |
+| Agent memory API | Working prototype | Authenticated redacted-summary storage, TTL retrieval, optional semantic search, and structured audit events |
+| Storage boundary | Working prototype | Checksummed page reads, bounded LRU buffer pool, slotted pages, durable checksummed index images, schema catalog sidecar, B+ tree lookup, and page-log compaction |
+| Backup and identity | Hardened prototype | Checksummed offline backup/restore plus PBKDF2-backed file identities and reader/operator/admin permissions |
+| MVCC | Experimental primitive | Row-version snapshots and serializable validation primitive; not yet integrated into SQL recovery |
 | Replication | Reference primitive | Ordered WAL stream and follower replay helper |
-| Enterprise hardening | Not complete | TLS and local request audit are available; external identity, encryption, backups, and production consensus remain future work |
+| Enterprise hardening | Not complete | TLS, local audit, backup/restore, and local identity roles are available; external identity, encryption, key management, and production consensus remain future work |
 
 ## Quick start
 
@@ -33,6 +34,7 @@ PYTHONPATH=. python3 -m novadb /tmp/novadb-demo --sql "CREATE TABLE users (id IN
 PYTHONPATH=. python3 -m novadb /tmp/novadb-demo --sql "INSERT INTO users VALUES (1, 'Ada', '{\"role\":\"admin\"}')"
 PYTHONPATH=. python3 -m novadb /tmp/novadb-demo --sql "SELECT name, JSON_EXTRACT(profile, '$.role') AS role FROM users"
 PYTHONPATH=. python3 -m novadb /tmp/novadb-demo --compact
+PYTHONPATH=. python3 -m novadb --production-gate production-gate-manifest.example.json --json
 ```
 
 For an interactive shell:
@@ -135,17 +137,17 @@ The design makes the distributed extension explicit. A leader can expose ordered
 |---|---|---|
 | SQL | Bounded parser, expression evaluator, prepared statements, and cost-based inner-join plans | Broader SQL coverage, window functions, and a fuller logical/physical planner |
 | Execution | Row scans with aggregate pipeline | Columnar batches, late materialization, parallel operators |
-| Storage | JSON state image plus checksummed page log, page reads, LRU buffer pool, catalog sidecar, compactable recovery snapshot, B+ tree-backed lookup | Slotted pages, durable on-disk B+ tree pages, crash-injection matrix |
-| Transactions | Snapshot copy plus optimistic version check | MVCC timestamps, lock manager, serializable validation |
+| Storage | JSON state image plus checksummed page log, verified slotted pages, LRU buffer pool, catalog sidecar, compactable recovery snapshot, and atomic durable B+ tree index images | Full table/index page integration, broader crash-injection matrix, and recovery protocol specification |
+| Transactions | Snapshot copy plus optimistic version check; tested row-version MVCC primitive | SQL-integrated MVCC timestamps, lock manager, serializable validation, and recovery rules |
 | Indexes | In-memory equality metadata plus B+ tree-backed lookup and deterministic vector ANN-style index | Durable on-disk trees, statistics catalog, deletes/range maintenance, and production ANN backend |
 | Replication | Ordered WAL replay plus deterministic Raft-style reference layer | Real transport, durable quorum acknowledgements, leases, and membership changes |
-| Service | Threaded HTTP JSON endpoint with bearer auth, abuse limits, request IDs, redacted 500s, optional TLS, local request audit, and bounded agent-memory routes | External identity, key rotation, durable quotas, centralized audit, and observability |
+| Service | Threaded HTTP JSON endpoint with bearer auth, abuse limits, request IDs, redacted 500s, optional TLS, local request audit, PBKDF2 file identities, and bounded agent-memory routes | External identity, key rotation, encryption/key management, durable quotas, centralized audit, and observability |
 
 ## Correctness and durability model
 
 A committed write is appended to the WAL, flushed, and then made visible to the engine snapshot. A transaction that begins against version `v` cannot commit after another transaction has advanced the database to a later version; it receives `TransactionConflict` and must be retried by the caller. This is deliberately conservative and easy to reason about, but it copies the whole catalog for each transaction and is therefore not suitable for high-concurrency production workloads.
 
-The recovery path loads the last checkpoint and replays only page-log records newer than its version. Checkpoint and compaction replacement use a temporary file followed by an atomic rename; page headers and record frames reject torn or checksum-invalid tails. A production engine would additionally need checksummed WAL frames, crash-injection tests across each fsync boundary, MVCC recovery rules, and a formally specified recovery protocol.
+The recovery path loads the last checkpoint and replays only page-log records newer than its version. Checkpoint and compaction replacement use a temporary file followed by an atomic rename; page headers, record frames, slotted pages, and durable index images reject checksum-invalid data. The engine now exposes fault injection at append and replacement boundaries and can recover a partial page tail. A production engine still needs a complete crash matrix, SQL-integrated MVCC recovery rules, and a formally specified recovery protocol.
 
 ## Throughput optimizations
 
@@ -195,7 +197,7 @@ The reusable agent workflow for extending NovaDB is available at `/home/ubuntu/s
 
 ## Validation
 
-The repository includes a dependency-free regression runner covering SQL execution, JSON extraction, strict structured/document vector validation, grouped aggregation, durability and recovery, optimistic conflicts, WAL follower replay, page checksums and reads, buffer-pool hits, durable catalog publication, B+ tree splits and indexed equality lookup, compaction/reopen recovery, deterministic vector nearest-neighbor ranking, prompt policy exposure, bounded agent-memory/embedding retrieval, authenticated memory HTTP routes, prepared batch inserts, bytecode queries, multi-table joins, optimizer plan selection through both API and CLI, Raft election and quorum commit, minority partition rejection, and replicated NovaDB commands.
+The repository includes a dependency-free regression runner covering SQL execution, JSON extraction, strict structured/document vector validation, grouped aggregation, durability and recovery, optimistic conflicts, WAL follower replay, page checksums and reads, buffer-pool hits, durable catalog publication, B+ tree splits and indexed equality lookup, slotted-page/index-image corruption, compaction/reopen recovery, deterministic vector nearest-neighbor ranking, prompt policy exposure, bounded agent-memory/embedding retrieval, authenticated memory HTTP routes, prepared batch inserts, bytecode queries, multi-table joins, optimizer plan selection through both API and CLI, Raft election and quorum commit, minority partition rejection, replicated NovaDB commands, backup/restore, identity roles, MVCC validation, and the fail-closed production evaluator.
 
 ```bash
 cd /home/ubuntu/novadb
@@ -211,7 +213,7 @@ PYTHONPATH=. python3 benchmarks/bench.py
 
 ## Roadmap toward an enterprise-grade engine
 
-The completed milestone closes the prompt-governance, vector-type, page-read/cache, catalog, B+ tree lookup, compaction, deterministic vector-index, optional TLS, and local audit priorities at prototype scope. The next serious engineering gates are durable on-disk B+ tree pages, slotted-page allocation, crash-injection recovery, row-version MVCC with serializable validation, production ANN benchmarking, external identity/key management, real consensus transport, backup/restore drills, and workload evidence. Each needs independent tests and failure evidence before it can be called production-ready.
+The completed milestone closes prompt governance, vector types, page-read/cache, catalog, B+ tree lookup, slotted-page/index-image checksums, compaction, deterministic vector indexing, backup/restore primitives, local identity roles, optional TLS, and local audit at prototype scope. The remaining production gates are SQL-integrated row-version MVCC, a complete crash-injection matrix, external identity and key management, durable audit retention, real consensus transport, production ANN benchmarking, scheduled restore drills, and independent workload/reliability review. Each needs evidence at the target deployment before it can be called production-ready. See [`PRODUCTION_GATES.md`](PRODUCTION_GATES.md).
 
 The phrase “better than Oracle” should therefore be evaluated by workload and dimension. NovaDB can plausibly aim to be better for a narrow set of developer-centric embedded workloads because it is smaller and more integrated. It should not claim superiority for enterprise breadth, operational maturity, or global distributed guarantees until those properties are implemented and independently measured.
 

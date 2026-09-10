@@ -16,6 +16,8 @@ from typing import Any, Iterable
 from .page_store import PageStore
 from .buffer_pool import PageBufferPool
 from .btree import BPlusTree
+from .backup import create_backup
+from .durable_index import DurableBPlusTree, DurableIndexError
 from .catalog import write as write_catalog
 from .engine_errors import VectorTypeError
 from .vector import VECTOR_TYPES, dense_vector, document_vector, embedding
@@ -848,11 +850,15 @@ class Engine:
             self.path.mkdir(parents=True, exist_ok=True)
         self.state_file = None if self.memory else self.path / "state.json"
         self.wal_file = None if self.memory else self.path / "wal.log"
-        self.page_store = None if self.memory else PageStore(self.path / "pages.dat")
+        self.page_store = None if self.memory else PageStore(self.path / "pages.dat", recover_torn_tail=True)
         self.buffer_pool = None if self.memory else PageBufferPool(self.page_store)
         self.catalog_file = None if self.memory else self.path / "catalog.json"
+        self.index_dir = None if self.memory else self.path / "indexes"
         self.tables: dict[str, Table] = {}
         self.version = 0
+        self.recovery_events: list[str] = []
+        if self.page_store is not None and self.page_store.recovered_torn_tail:
+            self.recovery_events.append("truncated_torn_page_tail")
         self._lock = threading.RLock()
         self._load()
 
@@ -879,6 +885,35 @@ class Engine:
                     continue
                 self._apply_operations(record["operations"])
                 self.version = max(self.version, record.get("version", self.version))
+        if self.index_dir is not None:
+            self._repair_index_images()
+
+    def _index_file(self, table_name: str, column: str) -> Path:
+        assert self.index_dir is not None
+        safe_table = re.sub(r"[^A-Za-z0-9_.-]", "_", table_name)
+        safe_column = re.sub(r"[^A-Za-z0-9_.-]", "_", column)
+        return self.index_dir / f"{safe_table}.{safe_column}.idx"
+
+    def _persist_index_images(self) -> None:
+        if self.index_dir is None:
+            return
+        self.index_dir.mkdir(parents=True, exist_ok=True)
+        for table_name, table in sorted(self.tables.items()):
+            for column, tree in sorted(table.btree_indexes.items()):
+                DurableBPlusTree(self._index_file(table_name, column)).save(tree)
+
+    def _repair_index_images(self) -> None:
+        if self.index_dir is None:
+            return
+        for table_name, table in sorted(self.tables.items()):
+            for column, tree in sorted(table.btree_indexes.items()):
+                store = DurableBPlusTree(self._index_file(table_name, column))
+                try:
+                    valid = store.verify(tree)
+                except (OSError, DurableIndexError):
+                    valid = False
+                if not valid:
+                    store.save(tree)
 
     def _apply_operations(self, operations: list[dict[str, Any]]) -> None:
         for item in operations:
@@ -988,6 +1023,7 @@ class Engine:
         tmp.replace(self.state_file)
         assert self.catalog_file is not None
         write_catalog(self.catalog_file, self.version, self.tables)
+        self._persist_index_images()
         self.wal_file.write_text("")
         with self.wal_file.open("rb+") as handle:
             os.fsync(handle.fileno())
@@ -1002,6 +1038,8 @@ class Engine:
             "version": self.version,
             "page_count": self.page_store.page_count,
             "catalog_present": self.catalog_file.exists(),
+            "durable_index_files": len(list(self.index_dir.glob("*.idx"))) if self.index_dir else 0,
+            "recovery_events": list(self.recovery_events),
             "buffer_pool": self.buffer_pool.stats().to_dict(),
         }
 
@@ -1037,6 +1075,14 @@ class Engine:
                 "row_count": sum(len(table.rows) for table in self.tables.values()),
                 "page_count": self.page_store.page_count,
             }
+
+    def backup(self, destination: str | os.PathLike[str]) -> dict[str, Any]:
+        """Checkpoint and create an offline, checksummed backup archive."""
+        if self.memory:
+            raise NovaDBError("in-memory databases cannot create a durable backup")
+        with self._lock:
+            self.checkpoint()
+            return create_backup(self.path, destination)
 
     def close(self) -> None:
         self.checkpoint()

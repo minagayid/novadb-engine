@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .engine import Engine, NovaDBError
+from .auth import IdentityStore, IdentityError
 from .memory import MemoryStore, MemoryValidationError, OpenAICompatibleEmbedder
 from .prompting import OpenAICompatiblePlanner, PromptSQLService
 
@@ -27,6 +28,7 @@ class NovaHandler(BaseHTTPRequestHandler):
     requests_per_minute = 60
     audit_path: str | None = None
     memory_store: MemoryStore | None = None
+    identity_store: IdentityStore | None = None
     _rate_lock = threading.Lock()
     _request_windows: dict[str, deque[float]] = defaultdict(deque)
 
@@ -78,11 +80,22 @@ class NovaHandler(BaseHTTPRequestHandler):
             return
 
     def _authorized(self) -> bool:
+        if self.identity_store is not None:
+            supplied = self.headers.get("Authorization", "")
+            token = supplied[7:] if supplied.startswith("Bearer ") else None
+            self._current_identity = self.identity_store.authenticate(token)
+            return self._current_identity is not None
         if self.token is None:
             return True
         supplied = self.headers.get("Authorization", "")
         expected = f"Bearer {self.token}"
         return hmac.compare_digest(supplied, expected)
+
+    def _permission_allowed(self, permission: str) -> bool:
+        if self.identity_store is None:
+            return True
+        identity = getattr(self, "_current_identity", None)
+        return identity is not None and self.identity_store.allowed(identity, permission)
 
     def _rate_allowed(self) -> bool:
         now = time.monotonic()
@@ -102,7 +115,7 @@ class NovaHandler(BaseHTTPRequestHandler):
                 "status": "ok",
                 "version": self.engine.version,
                 "table_count": len(self.engine.tables),
-                "authentication": self.token is not None,
+                "authentication": self.token is not None or self.identity_store is not None,
                 "request_limit_per_minute": self.requests_per_minute,
                 "prompt_to_sql": self.prompt_service is not None,
                 "llm_planner": bool(self.prompt_service and self.prompt_service.planner),
@@ -135,6 +148,9 @@ class NovaHandler(BaseHTTPRequestHandler):
             if not self._authorized():
                 self._send(401, {"ok": False, "error": "authentication required"}, request_id)
                 return
+            if not self._permission_allowed("read"):
+                self._send(403, {"ok": False, "error": "permission denied"}, request_id)
+                return
             if self.prompt_service is None:
                 self._send(422, {"ok": False, "error": "Prompt-to-SQL is not configured"}, request_id)
                 return
@@ -153,6 +169,10 @@ class NovaHandler(BaseHTTPRequestHandler):
             return
         if not self._authorized():
             self._send(401, {"ok": False, "error": "authentication required"}, request_id, {"WWW-Authenticate": "Bearer"})
+            return
+        permission = "write" if self.path in {"/prompt/approve", "/prompt/undo", "/prompt/redo", "/memory/upsert", "/audit"} else "read"
+        if not self._permission_allowed(permission):
+            self._send(403, {"ok": False, "error": "permission denied"}, request_id)
             return
         try:
             content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
@@ -174,6 +194,9 @@ class NovaHandler(BaseHTTPRequestHandler):
                 sql = payload["sql"]
                 if not isinstance(sql, str):
                     raise ValueError("sql must be a string")
+                if not sql.lstrip().upper().startswith(("SELECT", "SHOW", "EXPLAIN")) and not self._permission_allowed("write"):
+                    self._send(403, {"ok": False, "error": "write permission required", "request_id": request_id}, request_id)
+                    return
                 result = self.engine.execute(sql)
                 self._send(200, {"ok": True, "result": result}, request_id)
                 return
@@ -234,6 +257,7 @@ def serve(
     embedding_token: str | None = None,
     embedding_model: str = "bge-m3",
     memory_default_ttl: int = 7 * 24 * 60 * 60,
+    auth_file: str | None = None,
 ) -> None:
     if requests_per_minute < 1:
         raise ValueError("requests_per_minute must be positive")
@@ -241,7 +265,9 @@ def serve(
         raise ValueError("max_body_bytes is too small")
     if bool(tls_cert) != bool(tls_key):
         raise ValueError("tls_cert and tls_key must be provided together")
-    if host not in {"127.0.0.1", "localhost", "::1"} and not token:
+    if auth_file and token:
+        raise ValueError("choose auth_file or token authentication, not both")
+    if host not in {"127.0.0.1", "localhost", "::1"} and not token and not auth_file:
         raise ValueError("a bearer token is required when binding NovaDB beyond loopback")
     engine = Engine(path)
     NovaHandler.engine = engine
@@ -252,6 +278,11 @@ def serve(
     resolved_embedding_model = os.environ.get("NOVADB_EMBEDDING_MODEL", embedding_model)
     embedder = OpenAICompatibleEmbedder(resolved_embedding_url, model=resolved_embedding_model, token=resolved_embedding_token) if resolved_embedding_url else None
     NovaHandler.memory_store = MemoryStore(engine, embedder=embedder, default_ttl_seconds=memory_default_ttl)
+    try:
+        NovaHandler.identity_store = IdentityStore(auth_file) if auth_file else None
+    except IdentityError:
+        engine.close()
+        raise
     NovaHandler.token = token
     NovaHandler.max_body_bytes = max_body_bytes
     NovaHandler.requests_per_minute = requests_per_minute
@@ -292,8 +323,9 @@ def main() -> None:
     parser.add_argument("--embedding-token", default=os.environ.get("NOVADB_EMBEDDING_TOKEN"), help="Optional embedding bearer token")
     parser.add_argument("--embedding-model", default=os.environ.get("NOVADB_EMBEDDING_MODEL", "bge-m3"))
     parser.add_argument("--memory-default-ttl", type=int, default=int(os.environ.get("NOVADB_MEMORY_DEFAULT_TTL", 7 * 24 * 60 * 60)))
+    parser.add_argument("--auth-file", default=os.environ.get("NOVADB_AUTH_FILE"), help="PBKDF2-backed identity file; replaces --token")
     args = parser.parse_args()
-    serve(args.path, args.host, args.port, args.token, args.max_body_bytes, args.requests_per_minute, args.llm_url, args.llm_token, args.llm_model, args.tls_cert, args.tls_key, args.embedding_url, args.embedding_token, args.embedding_model, args.memory_default_ttl)
+    serve(args.path, args.host, args.port, args.token, args.max_body_bytes, args.requests_per_minute, args.llm_url, args.llm_token, args.llm_model, args.tls_cert, args.tls_key, args.embedding_url, args.embedding_token, args.embedding_model, args.memory_default_ttl, args.auth_file)
 
 
 if __name__ == "__main__":

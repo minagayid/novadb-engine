@@ -5,7 +5,9 @@ import json
 import sys
 from pathlib import Path
 
+from .backup import restore_backup
 from .engine import Engine, NovaDBError, format_rows
+from .production_gate import evaluate_production_gate, load_manifest
 
 
 def run_script(engine: Engine, text: str) -> None:
@@ -65,7 +67,21 @@ def main() -> None:
     parser.add_argument("--sql", help="execute one SQL statement")
     parser.add_argument("--file", type=Path, help="execute semicolon-separated SQL script")
     parser.add_argument("--compact", action="store_true", help="rewrite the durable page log")
+    parser.add_argument("--backup", type=Path, help="create a checksummed backup archive")
+    parser.add_argument("--restore", type=Path, help="restore a backup archive")
+    parser.add_argument("--restore-to", type=Path, help="new directory for --restore")
+    parser.add_argument("--production-gate", type=Path, help="evaluate a fail-closed production evidence manifest")
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON for --production-gate")
     args = parser.parse_args()
+    if args.production_gate:
+        report = evaluate_production_gate(load_manifest(args.production_gate))
+        print(json.dumps(report.to_dict(), indent=None if args.json else 2, sort_keys=bool(args.json)))
+        return
+    if args.restore:
+        if not args.restore_to:
+            parser.error("--restore requires --restore-to")
+        print(json.dumps(restore_backup(args.restore, args.restore_to), indent=2, ensure_ascii=False))
+        return
     engine = Engine(args.path)
     try:
         if args.sql:
@@ -75,6 +91,8 @@ def main() -> None:
             run_script(engine, args.file.read_text())
         elif args.compact:
             print(json.dumps(engine.compact(), indent=2, ensure_ascii=False))
+        elif args.backup:
+            print(json.dumps(engine.backup(args.backup), indent=2, ensure_ascii=False))
         else:
             repl(engine)
     finally:

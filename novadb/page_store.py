@@ -5,7 +5,7 @@ import os
 import struct
 import zlib
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 
 PAGE_SIZE = 16 * 1024
@@ -19,22 +19,46 @@ class PageCorruptionError(RuntimeError):
     pass
 
 
+class CrashInjected(RuntimeError):
+    """Test-only interruption raised at a named storage boundary."""
+
+
 class PageStore:
     """Append-oriented fixed-size page file used by the bulk write path."""
 
-    def __init__(self, path: str | os.PathLike[str], page_size: int = PAGE_SIZE):
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        page_size: int = PAGE_SIZE,
+        *,
+        recover_torn_tail: bool = False,
+        fault_injector: Callable[[str], None] | None = None,
+    ):
         if page_size <= HEADER_SIZE + 16:
             raise ValueError("page_size is too small")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.page_size = page_size
+        self.recovered_torn_tail = False
+        self.fault_injector = fault_injector
+        self.recover_torn_tail = recover_torn_tail
         self._next_page_id = self._discover_next_page_id()
+
+    def _inject(self, stage: str) -> None:
+        if self.fault_injector is not None:
+            self.fault_injector(stage)
 
     def _discover_next_page_id(self) -> int:
         if not self.path.exists():
             return 0
         size = self.path.stat().st_size
         if size % self.page_size:
+            if self.recover_torn_tail:
+                valid_size = size - (size % self.page_size)
+                with self.path.open("rb+") as handle:
+                    handle.truncate(valid_size)
+                self.recovered_torn_tail = True
+                return valid_size // self.page_size
             raise PageCorruptionError("page file ends with a partial page")
         return size // self.page_size
 
@@ -65,13 +89,17 @@ class PageStore:
             payload.extend(framed)
         if payload:
             pages.append((page_id, bytes(payload)))
+        self._inject("append_before_write")
         with self.path.open("ab") as handle:
             for current_id, page_payload in pages:
                 header = HEADER.pack(MAGIC, VERSION, current_id, len(page_payload), zlib.crc32(page_payload) & 0xFFFFFFFF)
                 handle.write(header + page_payload + bytes(self.page_size - HEADER_SIZE - len(page_payload)))
+                self._inject("append_after_page_write")
             handle.flush()
+            self._inject("append_after_flush")
             if sync:
                 os.fsync(handle.fileno())
+                self._inject("append_after_fsync")
         self._next_page_id = page_id + 1
         return [current_id for current_id, _ in pages]
 
@@ -122,5 +150,7 @@ class PageStore:
             replacement.append_records(records)
         else:
             temporary.touch()
+        self._inject("checkpoint_before_replace")
         temporary.replace(self.path)
+        self._inject("checkpoint_after_replace")
         self._next_page_id = replacement.next_page_id
