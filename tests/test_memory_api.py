@@ -41,6 +41,7 @@ def test_http_memory_requires_auth_and_records_audit():
     token = "memory-token-123"
     NovaHandler.engine = Engine()
     NovaHandler.token = token
+    NovaHandler.identity_store = None
     NovaHandler.memory_store = MemoryStore(NovaHandler.engine)
     NovaHandler.prompt_service = None
     NovaHandler.max_body_bytes = 1_048_576

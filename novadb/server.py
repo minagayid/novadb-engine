@@ -200,18 +200,24 @@ class NovaHandler(BaseHTTPRequestHandler):
                 result = self.engine.execute(sql)
                 self._send(200, {"ok": True, "result": result}, request_id)
                 return
-            if self.memory_store is None:
-                raise NovaDBError("Agent memory is not configured")
             if self.path == "/memory/upsert":
+                if self.memory_store is None:
+                    raise NovaDBError("Agent memory is not configured")
                 self._send(200, {"ok": True, "result": self.memory_store.upsert(payload)}, request_id)
                 return
             if self.path == "/memory/search":
+                if self.memory_store is None:
+                    raise NovaDBError("Agent memory is not configured")
                 self._send(200, {"ok": True, "result": self.memory_store.search(payload)}, request_id)
                 return
             if self.path == "/memory/recent":
+                if self.memory_store is None:
+                    raise NovaDBError("Agent memory is not configured")
                 self._send(200, {"ok": True, "result": self.memory_store.recent(payload)}, request_id)
                 return
             if self.path == "/audit":
+                if self.memory_store is None:
+                    raise NovaDBError("Agent memory is not configured")
                 self._send(200, {"ok": True, "result": self.memory_store.audit(payload)}, request_id)
                 return
             if self.prompt_service is None:
