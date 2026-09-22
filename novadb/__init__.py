@@ -1,3 +1,7 @@
+"""NovaDB — a compact embedded SQL/JSON/vector database-engine prototype."""
+
+__version__ = "0.1.0"
+
 from .bytecode import BytecodeProgram, Instruction, compile_expression, compile_predicate
 from .optimizer import QueryExecutor, QueryPlanner, PlanNode, hash_join, nested_loop_join
 from .raft import ConsensusSafetyError, LogEntry, NotLeaderError, RaftCluster, RaftNode, RaftStorage, ReplicatedEngine

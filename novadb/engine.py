@@ -132,14 +132,6 @@ def _find_keyword(text: str, keyword: str) -> int:
     depth = 0
     quote: str | None = None
     escaped = False
-    for match in pattern.finditer(text):
-        for ch in text[: match.start()]:
-            pass
-        # Re-scan only the segment from the previous candidate is unnecessary for
-        # our small SQL grammar; this stateful scan handles quoted parentheses.
-    depth = 0
-    quote = None
-    escaped = False
     for i, ch in enumerate(text):
         if quote:
             if escaped:
@@ -323,6 +315,11 @@ def _resolve_identifier(token: str, row: dict[str, Any]) -> Any:
 def compile_expr(expr: str):
     """Compile a safe expression once; the returned callable only reads a row."""
     expr = _strip_outer_parens(expr.strip())
+    if re.match(r"^(['\"]).*\1$", expr, re.DOTALL):
+        # Fully-quoted string literals come FIRST: the arithmetic pattern below
+        # would otherwise treat "a-b" as "'a' - 'b'" and silently evaluate to
+        # None, corrupting WHERE predicates and UPDATE assignments.
+        return lambda row: parse_value(expr)
     arithmetic = re.match(r"^(.*?)\s*([+\-*/])\s*(.*?)$", expr)
     if arithmetic and not re.match(r"^[+-]?\d+(?:\.\d+)?$", expr):
         left_fn = compile_expr(arithmetic.group(1))
@@ -375,6 +372,16 @@ def eval_expr(expr: str, row: dict[str, Any] | None = None) -> Any:
 def _sort_key(fn, row: dict[str, Any]):
     value = fn(row)
     return (value is None, value)
+
+
+def apply_order_by(result: list[dict[str, Any]], order_by: list[tuple[str, bool]] | None) -> list[dict[str, Any]]:
+    """Stable multi-key sort: apply keys from last to first so earlier keys win."""
+    if not order_by or not result:
+        return result
+    for expr, descending in reversed(order_by):
+        fn = compile_expr(expr)
+        result.sort(key=lambda row: _sort_key(fn, row), reverse=descending)
+    return result
 
 
 def eval_predicate(expr: str | None, row: dict[str, Any]) -> bool:
@@ -617,20 +624,39 @@ class Transaction:
             raise ConstraintError(f"Unknown column(s): {', '.join(sorted(set(assignments) - names))}")
         count = 0
         before_rows = copy.deepcopy(table.rows)
-        for row in table.rows:
-            if eval_predicate(where, row):
+        op_start = len(self.operations)
+        pk_columns = [c for c in table.columns if c.primary_key]
+        try:
+            for row in table.rows:
+                if not eval_predicate(where, row):
+                    continue
                 old = row.copy()
+                new_values: dict[str, Any] = {}
+                # Evaluate and coerce every assignment BEFORE mutating the row so
+                # a failed UPDATE leaves the row (and the transaction) untouched.
                 for col, expr in assignments.items():
-                    row[col] = table._coerce(next(c for c in table.columns if c.name == col), eval_expr(expr, row))
+                    column = next(c for c in table.columns if c.name == col)
+                    value = eval_expr(expr, row)
+                    if value is not None:
+                        value = table._coerce(column, value)
+                    new_values[col] = value
                 for col in table.columns:
-                    if col.not_null and row[col.name] is None:
+                    final = new_values.get(col.name, row[col.name])
+                    if col.not_null and final is None:
                         raise ConstraintError(f"Column {col.name} cannot be NULL")
+                for column in pk_columns:
+                    new_key = _value_key(new_values.get(column.name, row[column.name]))
+                    old_key = _value_key(row[column.name])
+                    if new_key in table.primary_keys[column.name] and new_key != old_key:
+                        raise ConstraintError(f"Duplicate primary key: {column.name}={new_values.get(column.name, row[column.name])!r}")
+                for col, value in new_values.items():
+                    row[col] = value
                 count += 1
                 self.operations.append({"op": "update", "table": table_name, "before": old, "after": row.copy()})
-        try:
             table.rebuild_indexes()
         except Exception:
             table.rows = before_rows
+            del self.operations[op_start:]
             table.rebuild_indexes()
             raise
         return count
@@ -650,7 +676,7 @@ class Transaction:
             self.operations.append({"op": "delete", "table": table_name, "row": row})
         return len(deleted)
 
-    def _fast_group_aggregate(self, rows: list[dict[str, Any]], expressions: list[str], group_by: list[str], alias_fns: dict[str, Any], order_by: tuple[str, bool] | None, limit: int | None) -> list[dict[str, Any]]:
+    def _fast_group_aggregate(self, rows: list[dict[str, Any]], expressions: list[str], group_by: list[str], alias_fns: dict[str, Any], order_by: list[tuple[str, bool]] | None, limit: int | None) -> list[dict[str, Any]]:
         specs = []
         for expression in expressions:
             alias_match = re.match(r"^(.*?)\s+AS\s+(\w+)$", expression, re.IGNORECASE | re.DOTALL)
@@ -700,9 +726,8 @@ class Transaction:
                             elif fn_name == "MAX":
                                 output[alias] = float(np.nanmax(values))
                         vector_result.append(output)
-                    if order_by and vector_result and order_by[0] in vector_result[0]:
-                        col, descending = order_by
-                        vector_result.sort(key=lambda item: _sort_key(lambda value: value.get(col), item), reverse=descending)
+                    if order_by:
+                        apply_order_by(vector_result, order_by)
                     return vector_result[:limit] if limit is not None else vector_result
             except (TypeError, ValueError):
                 pass
@@ -742,12 +767,11 @@ class Transaction:
                 else:
                     output[alias] = current.get(alias, 0 if fn_name == "COUNT" else None)
             result.append(output)
-        if order_by and result and order_by[0] in result[0]:
-            col, descending = order_by
-            result.sort(key=lambda item: _sort_key(lambda value: value.get(col), item), reverse=descending)
+        if order_by:
+            apply_order_by(result, order_by)
         return result[:limit] if limit is not None else result
 
-    def select(self, table_name: str, projection: str = "*", where: str | None = None, group_by: list[str] | None = None, order_by: tuple[str, bool] | None = None, limit: int | None = None) -> list[dict[str, Any]]:
+    def select(self, table_name: str, projection: str = "*", where: str | None = None, group_by: list[str] | None = None, order_by: list[tuple[str, bool]] | None = None, limit: int | None = None) -> list[dict[str, Any]]:
         table = self._table(table_name)
         rows = table.rows
         if where:
@@ -767,9 +791,8 @@ class Transaction:
             for name, raw in alias_map.items()
             if not re.match(r"^(COUNT|SUM|AVG|MIN|MAX)\s*\(", raw, re.IGNORECASE)
         }
-        if order_by and rows and order_by[0] not in rows[0]:
-            order_expr, descending = order_by
-            rows.sort(key=lambda item: _sort_key(compile_expr(order_expr), item), reverse=descending)
+        if order_by and rows and order_by[0][0] not in rows[0]:
+            apply_order_by(rows, order_by)
         aggregate = any(re.match(r"^(COUNT|SUM|AVG|MIN|MAX)\s*\(", expr.strip(), re.IGNORECASE) for expr in expressions)
         if aggregate and group_by:
             return self._fast_group_aggregate(rows, expressions, group_by, alias_fns, order_by, limit)
@@ -823,9 +846,8 @@ class Transaction:
                     alias = alias_match.group(2) if alias_match else raw
                     output[alias] = eval_expr(raw, row)
                 result.append(output)
-        if order_by and result and order_by[0] in result[0]:
-            col, descending = order_by
-            result.sort(key=lambda row: _sort_key(lambda item: item.get(col), row), reverse=descending)
+        if order_by:
+            apply_order_by(result, order_by)
         if limit is not None:
             result = result[:limit]
         return result
@@ -1150,7 +1172,7 @@ def _parse_create_table(sql: str) -> tuple[str, list[Column]]:
     return name, columns
 
 
-def _parse_where_tail(tail: str) -> tuple[str | None, tuple[str, bool] | None, int | None, list[str] | None]:
+def _parse_where_tail(tail: str) -> tuple[str | None, list[tuple[str, bool]] | None, int | None, list[str] | None]:
     where = None
     order_by = None
     limit = None
@@ -1172,11 +1194,22 @@ def _parse_where_tail(tail: str) -> tuple[str | None, tuple[str, bool] | None, i
         elif keyword == "GROUP BY":
             group_by = [x.strip() for x in _split_csv(value)]
         elif keyword == "ORDER BY":
-            order_match = re.match(r"^(.*?)(?:\s+(ASC|DESC))?$", value, re.IGNORECASE | re.DOTALL)
-            order_expr = order_match.group(1).strip() if order_match else value
-            order_by = (order_expr, bool(order_match and order_match.group(2) and order_match.group(2).upper() == "DESC"))
+            order_items = []
+            for part in _split_csv(value):
+                if not part:
+                    continue
+                order_match = re.match(r"^(.*?)(?:\s+(ASC|DESC))?$", part, re.IGNORECASE | re.DOTALL)
+                order_expr = order_match.group(1).strip() if order_match else part
+                order_items.append((order_expr, bool(order_match and order_match.group(2) and order_match.group(2).upper() == "DESC")))
+            if order_items:
+                order_by = order_items
         elif keyword == "LIMIT":
-            limit = int(value)
+            try:
+                limit = int(value)
+            except ValueError:
+                raise ParseError(f"Invalid LIMIT value: {value!r}")
+            if limit < 0:
+                raise ParseError(f"LIMIT must be a non-negative integer, got {limit}")
     return where, order_by, limit, group_by
 
 
@@ -1256,6 +1289,19 @@ def execute_in_transaction(tx: Transaction, sql: str) -> list[dict[str, Any]] | 
     if upper.startswith("SELECT") and re.search(r"\bJOIN\b", upper):
         from .optimizer import QueryExecutor
         return QueryExecutor(tx.tables).execute(sql)
+    if upper.startswith("SELECT") and not re.search(r"\bFROM\b", upper):
+        # SELECT without FROM — evaluate scalar expressions over a single empty
+        # row (SQLite-compatible smoke queries like "SELECT 1 + 1").
+        select_match = re.match(r"^SELECT\s+(.*)$", sql, re.IGNORECASE | re.DOTALL)
+        if not select_match:
+            raise ParseError("Expected SELECT expression list")
+        row_out: dict[str, Any] = {}
+        for expr in _split_csv(select_match.group(1)):
+            alias_match = re.match(r"^(.*?)\s+AS\s+(\w+)$", expr, re.IGNORECASE | re.DOTALL)
+            raw = alias_match.group(1).strip() if alias_match else expr.strip()
+            alias = alias_match.group(2) if alias_match else raw
+            row_out[alias] = eval_expr(raw, {})
+        return [row_out]
     if upper.startswith("SELECT"):
         match = re.match(r"^SELECT\s+(.*?)\s+FROM\s+(\w+)(.*)$", sql, re.IGNORECASE | re.DOTALL)
         if not match:
