@@ -29,7 +29,7 @@ It is **not** an honest claim to replace Oracle across every enterprise workload
 The engine requires only Python 3.11 or newer and has no third-party runtime dependencies.
 
 ```bash
-cd /home/ubuntu/novadb
+cd novadb
 PYTHONPATH=. python3 -m novadb /tmp/novadb-demo --sql "CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, profile JSON)"
 PYTHONPATH=. python3 -m novadb /tmp/novadb-demo --sql "INSERT INTO users VALUES (1, 'Ada', '{\"role\":\"admin\"}')"
 PYTHONPATH=. python3 -m novadb /tmp/novadb-demo --sql "SELECT name, JSON_EXTRACT(profile, '$.role') AS role FROM users"
@@ -42,6 +42,36 @@ For an interactive shell:
 ```bash
 PYTHONPATH=. python3 -m novadb /tmp/novadb-demo
 ```
+
+### Command-line reference
+
+`python -m novadb [PATH] [OPTIONS]` — `PATH` is a database directory, or
+`:memory:` (the default):
+
+| Option | Effect |
+|---|---|
+| `--sql "STATEMENT"` | Execute a single SQL statement and print the result |
+| `--file FILE.sql` | Execute a semicolon-separated script (fail-fast on error) |
+| `--compact` | Rewrite the durable page log to one recovery snapshot |
+| `--backup FILE` | Checkpoint and create a checksummed backup archive |
+| `--restore FILE --restore-to DIR` | Restore a backup into a new directory |
+| `--production-gate MANIFEST [--json]` | Evaluate a fail-closed evidence manifest |
+| `--version` | Print the NovaDB version and exit |
+
+Exit codes: `0` success, `1` any NovaDB/OS error (message on stderr, no
+traceback), `2` argument-usage error. Statements returning rows are rendered as
+a table; scalar/status results print as JSON. `--sql` runs exactly one
+statement — use `--file` for scripts.
+
+### SQL grammar notes
+
+Beyond the feature table above: string literals may contain `+ - / *` and are
+always preserved verbatim (`'a-b'` is a literal, never arithmetic); escape a
+single quote by doubling it (`'it''s'`). `ORDER BY` accepts multiple keys with
+per-key `ASC`/`DESC`. `SELECT` works without `FROM` for scalar expressions
+(`SELECT 1 + 1`, `SELECT 'x-y'`). `LIMIT` must be a non-negative integer.
+`UPDATE` enforces `PRIMARY KEY` uniqueness and is atomic: a failed statement
+leaves every row and the transaction unchanged.
 
 For the local HTTP service:
 
@@ -193,21 +223,21 @@ FROM users u JOIN orders o ON u.id = o.user_id
 WHERE o.amount >= 75;
 ```
 
-The reusable agent workflow for extending NovaDB is available at `/home/ubuntu/skills/novadb-engineering/SKILL.md`. The detailed implementation report is in [`DISTRIBUTED_OPTIMIZER_REPORT.md`](DISTRIBUTED_OPTIMIZER_REPORT.md).
+The reusable agent workflow for extending NovaDB is available at [`skills/novadb-engineering/SKILL.md`](skills/novadb-engineering/SKILL.md). The detailed implementation report is in [`DISTRIBUTED_OPTIMIZER_REPORT.md`](DISTRIBUTED_OPTIMIZER_REPORT.md).
 
 ## Validation
 
-The repository includes a dependency-free regression runner covering SQL execution, JSON extraction, strict structured/document vector validation, grouped aggregation, durability and recovery, optimistic conflicts, WAL follower replay, page checksums and reads, buffer-pool hits, durable catalog publication, B+ tree splits and indexed equality lookup, slotted-page/index-image corruption, compaction/reopen recovery, deterministic vector nearest-neighbor ranking, prompt policy exposure, bounded agent-memory/embedding retrieval, authenticated memory HTTP routes, prepared batch inserts, bytecode queries, multi-table joins, optimizer plan selection through both API and CLI, Raft election and quorum commit, minority partition rejection, replicated NovaDB commands, backup/restore, identity roles, MVCC validation, and the fail-closed production evaluator.
+The repository includes a dependency-free regression runner covering SQL execution, JSON extraction, strict structured/document vector validation, grouped aggregation, durability and recovery, optimistic conflicts, WAL follower replay, page checksums and reads, buffer-pool hits, durable catalog publication, B+ tree splits and indexed equality lookup, slotted-page/index-image corruption, compaction/reopen recovery, deterministic vector nearest-neighbor ranking, prompt policy exposure, bounded agent-memory/embedding retrieval, authenticated memory HTTP routes, prepared batch inserts, bytecode queries, multi-table joins, optimizer plan selection through both API and CLI, Raft election and quorum commit, minority partition rejection, replicated NovaDB commands, backup/restore, identity roles, MVCC validation, the fail-closed production evaluator, string-literal preservation (quoted values containing operators), primary-key enforcement and full rollback on failed `UPDATE`, `LIMIT` validation, scalar `SELECT` without `FROM`, multi-key `ORDER BY`, and CLI exit codes/error handling.
 
 ```bash
-cd /home/ubuntu/novadb
-PYTHONPATH=. python3 tests/test_runner.py
+cd novadb
+PYTHONPATH=. python3 -m tests.test_runner
 ```
 
 A reproducible comparison workload is available at `benchmarks/bench.py`. It compares the prototype with the Python standard library’s SQLite binding for a 10,000-row batch insert and grouped aggregate. The output is intentionally a measurement artifact, not a marketing claim: the workload, machine, Python build, durability mode, and data shape all affect the result.
 
 ```bash
-cd /home/ubuntu/novadb
+cd novadb
 PYTHONPATH=. python3 benchmarks/bench.py
 ```
 

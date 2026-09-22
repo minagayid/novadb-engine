@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .bytecode import BytecodeProgram, Instruction, compile_expression, compile_predicate
-from .engine import Engine, ParseError, _parse_insert, _parse_where_tail, _split_csv
+from .engine import Engine, ParseError, _parse_insert, _parse_where_tail, _split_csv, apply_order_by
 
 
 def _rebase_program(program: BytecodeProgram, offset: int) -> BytecodeProgram:
@@ -84,9 +84,8 @@ class PreparedStatement:
         if self._predicate_program:
             rows = [row for row in rows if bool(self._predicate_program.run(row, params))]
         result = [{alias: program.run(row, params) for _, alias, program in self._projection_programs} for row in rows]
-        if order_by and result and order_by[0] in result[0]:
-            column, descending = order_by
-            result.sort(key=lambda row: (row.get(column) is None, row.get(column)), reverse=descending)
+        if order_by:
+            apply_order_by(result, order_by)
         return result[:limit] if limit is not None else result
 
     def execute(self, params: Iterable[Any] = ()) -> Any:

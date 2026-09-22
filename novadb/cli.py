@@ -4,20 +4,26 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
+from . import __version__
 from .backup import restore_backup
-from .engine import Engine, NovaDBError, format_rows
+from .engine import NovaDBError, Engine, format_rows
 from .production_gate import evaluate_production_gate, load_manifest
+
+
+def _print_result_typed(result: Any) -> None:
+    if isinstance(result, list) and all(isinstance(row, dict) for row in result):
+        print(format_rows(result))
+    else:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 def run_script(engine: Engine, text: str) -> None:
     statements = [part.strip() for part in text.split(";") if part.strip()]
     for statement in statements:
         result = engine.execute(statement)
-        if isinstance(result, list):
-            print(format_rows(result))
-        else:
-            print(json.dumps(result, indent=2, ensure_ascii=False))
+        _print_result_typed(result)
 
 
 def repl(engine: Engine) -> None:
@@ -54,15 +60,15 @@ def repl(engine: Engine) -> None:
             continue
         try:
             result = engine.execute(buffer)
-            print(format_rows(result) if isinstance(result, list) else json.dumps(result, indent=2, ensure_ascii=False))
+            _print_result_typed(result)
         except NovaDBError as exc:
             print(f"error: {exc}", file=sys.stderr)
         finally:
             buffer = ""
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="NovaDB embedded SQL engine")
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="NovaDB embedded SQL engine", prog="novadb")
     parser.add_argument("path", nargs="?", default=":memory:", help="database directory, or :memory:")
     parser.add_argument("--sql", help="execute one SQL statement")
     parser.add_argument("--file", type=Path, help="execute semicolon-separated SQL script")
@@ -72,32 +78,40 @@ def main() -> None:
     parser.add_argument("--restore-to", type=Path, help="new directory for --restore")
     parser.add_argument("--production-gate", type=Path, help="evaluate a fail-closed production evidence manifest")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON for --production-gate")
-    args = parser.parse_args()
-    if args.production_gate:
-        report = evaluate_production_gate(load_manifest(args.production_gate))
-        print(json.dumps(report.to_dict(), indent=None if args.json else 2, sort_keys=bool(args.json)))
-        return
-    if args.restore:
-        if not args.restore_to:
-            parser.error("--restore requires --restore-to")
-        print(json.dumps(restore_backup(args.restore, args.restore_to), indent=2, ensure_ascii=False))
-        return
-    engine = Engine(args.path)
+    parser.add_argument("--version", action="store_true", help="print the NovaDB version and exit")
+    args = parser.parse_args(argv)
     try:
-        if args.sql:
-            result = engine.execute(args.sql)
-            print(format_rows(result) if isinstance(result, list) else json.dumps(result, indent=2, ensure_ascii=False))
-        elif args.file:
-            run_script(engine, args.file.read_text())
-        elif args.compact:
-            print(json.dumps(engine.compact(), indent=2, ensure_ascii=False))
-        elif args.backup:
-            print(json.dumps(engine.backup(args.backup), indent=2, ensure_ascii=False))
-        else:
-            repl(engine)
-    finally:
-        engine.close()
+        if args.version:
+            print(f"novadb {__version__}")
+            return 0
+        if args.production_gate:
+            report = evaluate_production_gate(load_manifest(args.production_gate))
+            print(json.dumps(report.to_dict(), indent=None if args.json else 2, sort_keys=bool(args.json)))
+            return 0
+        if args.restore:
+            if not args.restore_to:
+                parser.error("--restore requires --restore-to")
+            print(json.dumps(restore_backup(args.restore, args.restore_to), indent=2, ensure_ascii=False))
+            return 0
+        engine = Engine(args.path)
+        try:
+            if args.sql:
+                _print_result_typed(engine.execute(args.sql))
+            elif args.file:
+                run_script(engine, args.file.read_text(encoding="utf-8"))
+            elif args.compact:
+                print(json.dumps(engine.compact(), indent=2, ensure_ascii=False))
+            elif args.backup:
+                print(json.dumps(engine.backup(args.backup), indent=2, ensure_ascii=False))
+            else:
+                repl(engine)
+        finally:
+            engine.close()
+        return 0
+    except (NovaDBError, OSError, ValueError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
