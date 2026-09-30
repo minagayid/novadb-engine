@@ -1,10 +1,28 @@
 import json
 import threading
 import http.client
+import pytest
 
 from novadb import Engine, IdentityStore
 from novadb.memory import MemoryStore
 from novadb.server import NovaHandler, ThreadingHTTPServer
+
+
+@pytest.fixture(autouse=True)
+def restore_handler_configuration():
+    """HTTP fixtures must not leave role authentication active in later suites."""
+    names = ("engine", "token", "identity_store", "memory_store", "prompt_service",
+             "max_body_bytes", "requests_per_minute")
+    missing = object()
+    previous = {name: getattr(NovaHandler, name, missing) for name in names}
+    yield
+    for name, value in previous.items():
+        if value is missing:
+            if hasattr(NovaHandler, name):
+                delattr(NovaHandler, name)
+        else:
+            setattr(NovaHandler, name, value)
+    NovaHandler._request_windows.clear()
 
 
 def _request(port, method, path, body=None, token=None):

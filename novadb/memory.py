@@ -214,6 +214,9 @@ class MemoryStore:
         tx = self.engine.begin()
         table = tx._table(MEMORY_TABLE)
         for existing in [item for item in table.rows if item.get("memory_id") == memory_id]:
+            if existing.get("namespace") != namespace or existing.get("session_id") != session_id:
+                tx.rollback()
+                raise MemoryValidationError("memory_id belongs to a different memory scope")
             tx.delete(MEMORY_TABLE, f"memory_id = '{memory_id}'")
             break
         tx.delete(MEMORY_TABLE, f"expires_at <= {now}")

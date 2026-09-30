@@ -220,3 +220,7 @@ The phrase “better than Oracle” should therefore be evaluated by workload an
 ## License and status
 
 This repository is an experimental prototype intended for evaluation and extension. It is not production-ready and should not be used as the sole store for irreplaceable data.
+
+## Agent evaluation roadmap
+
+See [evaluation contracts and evidence gates](docs/evaluation-roadmap.md) and [Agent Eval Lab](https://github.com/minagayid/agent-eval-lab).
